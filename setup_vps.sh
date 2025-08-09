@@ -17,12 +17,12 @@ get_user_input() {
 
 install_wireguard() {
     echo "--- Install Wireguard ---"
-
+    
     echo "Installing WireGuard..."
     sudo apt update -qq > /dev/null 2>&1
     sudo apt install -y -qq wireguard > /dev/null 2>&1
     echo "WireGuard installed successfully."
-
+    
     echo "Creating Wireguard Directory..."
     sudo mkdir -p /etc/wireguard
 }
@@ -32,7 +32,7 @@ wireguard_setup() {
     sudo wg genkey | sudo tee /etc/wireguard/privatekey > /dev/null
     sudo cat /etc/wireguard/privatekey | sudo wg pubkey | sudo tee /etc/wireguard/publickey > /dev/null
     VPS_PRIVATE_KEY=$(cat /etc/wireguard/privatekey)
-
+    
     echo "Creating Wireguard Config File..."
     sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOL
 [Interface]
@@ -71,7 +71,7 @@ main() {
     install_wireguard
     wireguard_setup
     activating_ip_forwarding
-
+    
     echo "VPS setup for port forwarding is complete."
     echo "Please ensure to replace <Public_Key_of_Home_Server> in the wg0.conf file."
     echo ""

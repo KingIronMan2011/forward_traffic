@@ -49,12 +49,12 @@ get_user_input() {
         echo "Error: Port and protocol cannot be empty."
         exit 1
     fi
-
+    
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
         echo "Error: Invalid port number. Please enter a number between 1 and 65535."
         exit 1
     fi
-
+    
     if [[ "$PROTOCOL" != "tcp" && "$PROTOCOL" != "udp" && "$PROTOCOL" != "all" ]]; then
         echo "Error: Invalid protocol. Please enter 'tcp', 'udp', or 'all'."
         exit 1
@@ -138,7 +138,7 @@ main() {
     check_dependencies
     check_variables
     get_user_input
-
+    
     if [[ "$PROTOCOL" = "tcp" ]]; then
         apply_rules
         elif [[ "$PROTOCOL" = "udp" ]]; then
