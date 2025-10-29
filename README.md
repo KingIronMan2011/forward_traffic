@@ -73,7 +73,8 @@ If you want to forward specific ports from the VPS to your home server:
    - **Combined**: `80,443,8000-8010,9000`
 
    Examples:
-   ```
+
+   ```txt
    Enter the port(s) to forward: 80
    Enter the port(s) to forward: 25565-26676
    Enter the port(s) to forward: 80,443,8080
