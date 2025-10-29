@@ -65,6 +65,22 @@ If you want to forward specific ports from the VPS to your home server:
    ./forward_traffic.sh
    ```
 
+2. The script supports multiple port forwarding formats:
+   - **Single port**: `80`
+   - **Port range**: `25565-25575` or `8000-9000`
+   - **Comma-separated ports**: `80,443,8080`
+   - **Semicolon-separated ports**: `80;443;8080`
+   - **Combined**: `80,443,8000-8010,9000`
+
+   Examples:
+   ```
+   Enter the port(s) to forward: 80
+   Enter the port(s) to forward: 25565-26676
+   Enter the port(s) to forward: 80,443,8080
+   Enter the port(s) to forward: 80;443
+   Enter the port(s) to forward: 80,443,8000-8010
+   ```
+
 ## Verifying the Setup
 
 - Check WireGuard status:
