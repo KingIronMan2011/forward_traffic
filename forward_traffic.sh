@@ -109,6 +109,8 @@ get_user_input() {
         echo "Error: Port and protocol cannot be empty."
         exit 1
     fi
+
+    PROTOCOL="${PROTOCOL,,}"
     
     if [[ "$PROTOCOL" != "tcp" && "$PROTOCOL" != "udp" && "$PROTOCOL" != "all" ]]; then
         echo "Error: Invalid protocol. Please enter 'tcp', 'udp', or 'all'."
