@@ -1,16 +1,14 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # --- Configuration ---
-# IMPORTANT: Replace 'eth0' with your actual public network interface name (e.g., ens3, venet0).
-# You can find this using 'ip a' or 'ifconfig'.
+// ...existing code...
 PUBLIC_NETWORK_INTERFACE="ens6"
-
-# IMPORTANT: Replace '10.0.0.1' with the internal VPN IP address of your VPS.
-# This is the 'Address' you set in your VPS's wg0.conf file.
 VPS_VPN_IP="10.0.0.1"
-
 HOME_SERVER_IP="10.0.0.2"
 
+// ...existing code...
 check_dependencies() {
     # --- Dependency Check ---
     echo "--- Checking dependencies ---"
@@ -26,12 +24,79 @@ check_dependencies() {
     echo ""
 }
 
+# New: ensure sudo or root
+require_sudo_or_root() {
+    if [ "$EUID" -ne 0 ] && ! command -v sudo &> /dev/null; then
+        echo "Error: This script requires root or sudo. Install sudo or run as root."
+        exit 1
+    fi
+}
+
+validate_ip() {
+    local ip="$1"
+    # Basic IPv4 validation
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        echo "Error: Invalid IP address: $ip"
+        exit 1
+    fi
+    # check octet ranges
+    IFS='.' read -r a b c d <<< "$ip"
+    for oct in "$a" "$b" "$c" "$d"; do
+        if ((oct < 0 || oct > 255)); then
+            echo "Error: Invalid IP address: $ip"
+            exit 1
+        fi
+    done
+}
+
+interface_exists() {
+    if ! ip link show "$PUBLIC_NETWORK_INTERFACE" &> /dev/null; then
+        echo "Warning: Network interface '$PUBLIC_NETWORK_INTERFACE' not found."
+        read -p "Continue anyway? [y/N]: " ans
+        ans="${ans,,}"
+        if [[ "$ans" != "y" ]]; then
+            echo "Aborting."
+            exit 1
+        fi
+    fi
+}
+
+# New helper: add iptables rule only if it doesn't already exist
+iptables_add() {
+    local table="$1"; shift
+    # Try to check the exact rule first; if missing, append it.
+    if sudo iptables -t "$table" -C "$@" >/dev/null 2>&1; then
+        echo "iptables: rule already exists (skipping): -t $table $*"
+    else
+        echo "iptables: adding rule: -t $table $*"
+        sudo iptables -t "$table" -A "$@"
+    fi
+}
+
 check_variables() {
     # --- Variable Check ---
     if [[ -z "$PUBLIC_NETWORK_INTERFACE" || -z "$VPS_VPN_IP" || -z "$HOME_SERVER_IP" ]]; then
         echo "Error: One or more required variables are not set."
         echo "Please ensure PUBLIC_NETWORK_INTERFACE, VPS_VPN_IP, and HOME_SERVER_IP are set correctly."
         exit 1
+    fi
+
+    validate_ip "$VPS_VPN_IP"
+    validate_ip "$HOME_SERVER_IP"
+    interface_exists
+}
+
+# New: warn if many ports
+confirm_large_port_list() {
+    local count="$1"
+    if [ "$count" -gt 100 ]; then
+        echo "Warning: You are about to create $count iptables rules. This may be slow and hard to manage."
+        read -p "Proceed? [y/N]: " yn
+        yn="${yn,,}"
+        if [[ "$yn" != "y" ]]; then
+            echo "Aborting."
+            exit 1
+        fi
     fi
 }
 
@@ -124,6 +189,9 @@ get_user_input() {
         echo "Error: No valid ports found."
         exit 1
     fi
+
+    # Warn for large lists
+    confirm_large_port_list "${#PORTS[@]}"
     
     echo ""
     echo "Ports to forward: ${PORTS[@]}"
@@ -138,26 +206,29 @@ apply_rules() {
     # 1. Enable IP forwarding (if not already enabled)
     echo "Enabling IP forwarding..."
     sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+
+    # Persist ip_forward
+    echo "Persisting net.ipv4.ip_forward=1 to /etc/sysctl.d/99-forward.conf"
+    echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-forward.conf > /dev/null
+    sudo sysctl --system > /dev/null 2>&1
     
     # Loop through all ports
     for PORT in "${PORTS[@]}"; do
         echo "Configuring rules for port $PORT..."
         
         # 2. PREROUTING: Redirect incoming traffic from VPS public IP to home server's internal IP and port
-        sudo iptables -t nat -A PREROUTING -p "$PROTOCOL" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_add nat -p "$PROTOCOL" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
         
         # 3. POSTROUTING: Rewrite source IP for outgoing traffic from home server to appear as VPS
-        sudo iptables -t nat -A POSTROUTING -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_add nat -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
         
         # 4. FORWARD: Allow forwarded traffic through the firewall
-        sudo iptables -A FORWARD -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        iptables_add filter -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
     done
     
     # 5. MASQUERADE for general outgoing traffic from the VPN interface
-    # This ensures that traffic originating from the VPN tunnel (e.g., your home server accessing the internet through the VPS)
-    # is properly NATed to the VPS's public IP.
     echo "Adding MASQUERADE rule for VPN interface..."
-    sudo iptables -t nat -A POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
+    iptables_add nat -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     
     # 6. Saving iptables
     echo "Saving iptables..."
@@ -175,29 +246,32 @@ apply_rules_all() {
     # 1. Enable IP forwarding (if not already enabled)
     echo "Enabling IP forwarding..."
     sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+
+    # Persist ip_forward
+    echo "Persisting net.ipv4.ip_forward=1 to /etc/sysctl.d/99-forward.conf"
+    echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-forward.conf > /dev/null
+    sudo sysctl --system > /dev/null 2>&1
     
     # Loop through all ports
     for PORT in "${PORTS[@]}"; do
         echo "Configuring rules for port $PORT (TCP and UDP)..."
         
         # 2. PREROUTING: Redirect incoming traffic from VPS public IP to home server's internal IP and port
-        sudo iptables -t nat -A PREROUTING -p tcp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
-        sudo iptables -t nat -A PREROUTING -p udp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_add nat -p tcp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_add nat -p udp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
         
         # 3. POSTROUTING: Rewrite source IP for outgoing traffic from home server to appear as VPS
-        sudo iptables -t nat -A POSTROUTING -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
-        sudo iptables -t nat -A POSTROUTING -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_add nat -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_add nat -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
         
         # 4. FORWARD: Allow forwarded traffic through the firewall
-        sudo iptables -A FORWARD -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-        sudo iptables -A FORWARD -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        iptables_add filter -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        iptables_add filter -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
     done
     
     # 5. MASQUERADE for general outgoing traffic from the VPN interface
-    # This ensures that traffic originating from the VPN tunnel (e.g., your home server accessing the internet through the VPS)
-    # is properly NATed to the VPS's public IP.
     echo "Adding MASQUERADE rule for VPN interface..."
-    sudo iptables -t nat -A POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
+    iptables_add nat -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     
     # 6. Saving iptables
     echo "Saving iptables..."
@@ -209,6 +283,7 @@ apply_rules_all() {
 }
 
 main() {
+    require_sudo_or_root
     check_dependencies
     check_variables
     get_user_input

@@ -26,7 +26,6 @@ This project provides scripts to configure secure port forwarding between a VPS 
    ```
 
 2. Follow the prompts:
-
    - Enter the public IP address of your VPS.
    - Enter the public key of your VPS (you can get this from `/etc/wireguard/publickey` on the VPS after running its setup).
 
@@ -45,7 +44,6 @@ This project provides scripts to configure secure port forwarding between a VPS 
    ```
 
 2. Follow the prompts:
-
    - Enter the public network interface (e.g., `eth0`, `ens3`).
    - Enter the public key of your home server (from `/etc/wireguard/publickey` on the home server).
 
