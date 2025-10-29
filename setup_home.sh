@@ -1,6 +1,13 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
+
+require_sudo_or_root() {
+    if [ "$EUID" -ne 0 ] && ! command -v sudo &> /dev/null; then
+        echo "Error: This script requires root or sudo. Install sudo or run as root."
+        exit 1
+    fi
+}
 
 get_user_input() {
     echo "We need some information to set up the Home Server for port forwarfing"
@@ -53,6 +60,7 @@ EOL
 }
 
 main() {
+    require_sudo_or_root
     get_user_input
     install_wireguard
     wireguard_setup
