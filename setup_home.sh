@@ -2,77 +2,63 @@
 
 set -euo pipefail
 
-require_sudo_or_root() {
-    if [ "$EUID" -ne 0 ] && ! command -v sudo &> /dev/null; then
-        echo "Error: This script requires root or sudo. Install sudo or run as root."
-        exit 1
-    fi
-}
-
-get_user_input() {
-    echo "We need some information to set up the Home Server for port forwarfing"
-    echo ""
-    while true; do
-        read -p "Enter the public IP address of the VPS: " VPS_PUBLIC_IP
-        if [[ $VPS_PUBLIC_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            break
-        else
-            echo "Invalid IP address format. Please try again."
-        fi
-    done
-}
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 install_wireguard() {
-    echo "--- Install Wireguard ---"
-    
-    echo "Installing WireGuard..."
-    sudo apt update -qq > /dev/null 2>&1
-    sudo apt install -y -qq wireguard > /dev/null 2>&1
-    echo "WireGuard installed successfully."
-    
-    echo "Creating Wireguard Directory..."
+    echo "--- Installing WireGuard ---"
+    sudo apt-get update -qq &>/dev/null
+    sudo apt-get install -y -qq wireguard &>/dev/null
     sudo mkdir -p /etc/wireguard
+    echo "WireGuard installed."
 }
 
 wireguard_setup() {
-    echo "Generating WireGuard keys..."
+    echo "--- Generating WireGuard keys ---"
     sudo wg genkey | sudo tee /etc/wireguard/privatekey > /dev/null
     sudo chmod 600 /etc/wireguard/privatekey
     sudo wg pubkey < /etc/wireguard/privatekey | sudo tee /etc/wireguard/publickey > /dev/null
-    HOME_PRIVATE_KEY=$(sudo cat /etc/wireguard/privatekey)
-    
-    echo "Creating Wireguard Config File..."
-    sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOL
+    local privkey
+    privkey=$(sudo cat /etc/wireguard/privatekey)
+
+    echo "--- Creating /etc/wireguard/wg0.conf ---"
+    sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
 [Interface]
-# Private IP address of the home server within the VPN tunnel
-Address = 10.0.0.2/24
-# Private key of the home server
-PrivateKey = ${HOME_PRIVATE_KEY}
+Address    = 10.0.0.2/24
+PrivateKey = ${privkey}
+
 [Peer]
-# Public key of the VPS
-PublicKey = <Public_Key_of_VPS>
-# The public IP address of the VPS and the listening port
-Endpoint = ${VPS_PUBLIC_IP}:51820
-# IP addresses allowed to be routed through this tunnel
-AllowedIPs = 10.0.0.1/32
-# Persist the connection if there is no traffic
+# Replace with the output of: cat /etc/wireguard/publickey  (on the VPS)
+PublicKey           = <Public_Key_of_VPS>
+Endpoint            = ${VPS_PUBLIC_IP}:51820
+AllowedIPs          = 10.0.0.1/32
 PersistentKeepalive = 25
-EOL
+EOF
 }
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 main() {
-    require_sudo_or_root
-    get_user_input
+    [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null || {
+        echo "Error: root or sudo required." >&2; exit 1
+    }
+
+    echo "Home server setup for WireGuard port forwarding."
+    echo
+    while true; do
+        read -rp "Public IP address of the VPS: " VPS_PUBLIC_IP
+        [[ "$VPS_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break || echo "Invalid IP format. Try again."
+    done
+
     install_wireguard
     wireguard_setup
-    
-    echo "Enabling WireGuard to start automatically on boot..."
     sudo systemctl enable wg-quick@wg0
-    
-    echo "Home Server setup for port forwarding is complete."
-    echo "Please ensure to replace <Public_Key_of_VPS> in the wg0.conf file."
-    echo ""
-    echo "After you set your key run the command 'wg-quick up wg0' and your done!"
+
+    echo
+    echo "✓ Home server setup complete."
+    echo "  1. Copy your VPS public key into /etc/wireguard/wg0.conf"
+    echo "     (replace <Public_Key_of_VPS>)"
+    echo "  2. Run: sudo wg-quick up wg0"
+    echo "  Your home server public key (share with VPS): $(sudo cat /etc/wireguard/publickey)"
 }
 
 main

@@ -2,92 +2,71 @@
 
 set -euo pipefail
 
-require_sudo_or_root() {
-    if [ "$EUID" -ne 0 ] && ! command -v sudo &> /dev/null; then
-        echo "Error: This script requires root or sudo. Install sudo or run as root."
-        exit 1
-    fi
-}
-
-get_user_input() {
-    echo "We need some information to set up the VPS for port forwarding."
-    echo ""
-    while true; do
-        read -p "Enter the public network interface (e.g., eth0, ens3): " PUBLIC_NETWORK_INTERFACE
-        if ip link show "$PUBLIC_NETWORK_INTERFACE" > /dev/null 2>&1; then
-            break
-        else
-            echo "Invalid network interface. Please try again."
-        fi
-    done
-}
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 install_wireguard() {
-    echo "--- Install Wireguard ---"
-    
-    echo "Installing WireGuard..."
-    sudo apt update -qq > /dev/null 2>&1
-    sudo apt install -y -qq wireguard > /dev/null 2>&1
-    echo "WireGuard installed successfully."
-    
-    echo "Creating Wireguard Directory..."
+    echo "--- Installing WireGuard ---"
+    sudo apt-get update -qq &>/dev/null
+    sudo apt-get install -y -qq wireguard &>/dev/null
     sudo mkdir -p /etc/wireguard
+    echo "WireGuard installed."
 }
 
 wireguard_setup() {
-    echo "Generating WireGuard keys..."
+    echo "--- Generating WireGuard keys ---"
     sudo wg genkey | sudo tee /etc/wireguard/privatekey > /dev/null
     sudo chmod 600 /etc/wireguard/privatekey
     sudo wg pubkey < /etc/wireguard/privatekey | sudo tee /etc/wireguard/publickey > /dev/null
-    VPS_PRIVATE_KEY=$(sudo cat /etc/wireguard/privatekey)
-    
-    echo "Creating Wireguard Config File..."
-    sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOL
+    local privkey
+    privkey=$(sudo cat /etc/wireguard/privatekey)
+
+    echo "--- Creating /etc/wireguard/wg0.conf ---"
+    sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
 [Interface]
-# Private IP address of the VPS within the VPN tunnel
-Address = 10.0.0.1/24
-# Private key of the VPS
-PrivateKey = ${VPS_PRIVATE_KEY}
-# Enable IP forwarding
-PostUp = sysctl -w net.ipv4.ip_forward=1
-# Enable NAT (Network Address Translation)
-# This will forward traffic from the VPS's public IP to the home server
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${PUBLIC_NETWORK_INTERFACE} -j MASQUERADE
-# Disable IP forwarding and NAT on shutdown
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${PUBLIC_NETWORK_INTERFACE} -j MASQUERADE
-# Listen port
+Address    = 10.0.0.1/24
+PrivateKey = ${privkey}
 ListenPort = 51820
+PostUp     = sysctl -w net.ipv4.ip_forward=1; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${PUBLIC_IFACE} -j MASQUERADE
+PostDown   = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${PUBLIC_IFACE} -j MASQUERADE
+
 [Peer]
-# Public key of the home server
-PublicKey = <Public_Key_of_Home_Server>
-# IP address of the home server within the VPN tunnel
+# Replace with the output of: cat /etc/wireguard/publickey  (on the home server)
+PublicKey  = <Public_Key_of_Home_Server>
 AllowedIPs = 10.0.0.2/32
-EOL
+EOF
 }
 
-activating_ip_forwarding() {
-    echo "--- Activating IP Forwarding ---"
-    sudo sysctl -w net.ipv4.ip_forward=1
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf > /dev/null
-    fi
-    echo "IP forwarding activated."
+persist_ip_forwarding() {
+    sudo sysctl -w net.ipv4.ip_forward=1 &>/dev/null
+    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null \
+        || echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf > /dev/null
 }
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    require_sudo_or_root
-    get_user_input
+    [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null || {
+        echo "Error: root or sudo required." >&2; exit 1
+    }
+
+    echo "VPS setup for WireGuard port forwarding."
+    echo
+    while true; do
+        read -rp "Public network interface (e.g. eth0, ens3): " PUBLIC_IFACE
+        ip link show "$PUBLIC_IFACE" &>/dev/null && break || echo "Interface not found. Try again."
+    done
+
     install_wireguard
     wireguard_setup
-    activating_ip_forwarding
-    
-    echo "Enabling WireGuard to start automatically on boot..."
+    persist_ip_forwarding
     sudo systemctl enable wg-quick@wg0
-    
-    echo "VPS setup for port forwarding is complete."
-    echo "Please ensure to replace <Public_Key_of_Home_Server> in the wg0.conf file."
-    echo ""
-    echo "After you set your key run the command 'wg-quick up wg0' and your done!"
+
+    echo
+    echo "✓ VPS setup complete."
+    echo "  1. Copy your home server's public key into /etc/wireguard/wg0.conf"
+    echo "     (replace <Public_Key_of_Home_Server>)"
+    echo "  2. Run: sudo wg-quick up wg0"
+    echo "  Your VPS public key (share with home server): $(sudo cat /etc/wireguard/publickey)"
 }
 
 main
