@@ -3,12 +3,10 @@
 set -euo pipefail
 
 # --- Configuration ---
-// ...existing code...
 PUBLIC_NETWORK_INTERFACE="ens6"
 VPS_VPN_IP="10.0.0.1"
 HOME_SERVER_IP="10.0.0.2"
 
-// ...existing code...
 check_dependencies() {
     # --- Dependency Check ---
     echo "--- Checking dependencies ---"
@@ -217,18 +215,18 @@ apply_rules() {
         echo "Configuring rules for port $PORT..."
         
         # 2. PREROUTING: Redirect incoming traffic from VPS public IP to home server's internal IP and port
-        iptables_add nat -p "$PROTOCOL" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_add nat PREROUTING -p "$PROTOCOL" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
         
         # 3. POSTROUTING: Rewrite source IP for outgoing traffic from home server to appear as VPS
-        iptables_add nat -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_add nat POSTROUTING -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
         
         # 4. FORWARD: Allow forwarded traffic through the firewall
-        iptables_add filter -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        iptables_add filter FORWARD -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
     done
     
-    # 5. MASQUERADE for general outgoing traffic from the VPN interface
-    echo "Adding MASQUERADE rule for VPN interface..."
-    iptables_add nat -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
+    # 5. MASQUERADE for general outgoing traffic from the public interface
+    echo "Adding MASQUERADE rule for public interface..."
+    iptables_add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     
     # 6. Saving iptables
     echo "Saving iptables..."
@@ -257,21 +255,22 @@ apply_rules_all() {
         echo "Configuring rules for port $PORT (TCP and UDP)..."
         
         # 2. PREROUTING: Redirect incoming traffic from VPS public IP to home server's internal IP and port
-        iptables_add nat -p tcp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
-        iptables_add nat -p udp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_add nat PREROUTING -p tcp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_add nat PREROUTING -p udp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
         
         # 3. POSTROUTING: Rewrite source IP for outgoing traffic from home server to appear as VPS
-        iptables_add nat -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
-        iptables_add nat -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_add nat POSTROUTING -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_add nat POSTROUTING -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
         
         # 4. FORWARD: Allow forwarded traffic through the firewall
-        iptables_add filter -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-        iptables_add filter -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        # TCP uses full stateful tracking; UDP is stateless so RELATED is omitted
+        iptables_add filter FORWARD -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+        iptables_add filter FORWARD -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
     done
     
-    # 5. MASQUERADE for general outgoing traffic from the VPN interface
-    echo "Adding MASQUERADE rule for VPN interface..."
-    iptables_add nat -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
+    # 5. MASQUERADE for general outgoing traffic from the public interface
+    echo "Adding MASQUERADE rule for public interface..."
+    iptables_add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     
     # 6. Saving iptables
     echo "Saving iptables..."

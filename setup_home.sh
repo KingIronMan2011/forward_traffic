@@ -37,8 +37,9 @@ install_wireguard() {
 wireguard_setup() {
     echo "Generating WireGuard keys..."
     sudo wg genkey | sudo tee /etc/wireguard/privatekey > /dev/null
-    sudo cat /etc/wireguard/privatekey | sudo wg pubkey | sudo tee /etc/wireguard/publickey > /dev/null
-    HOME_PRIVATE_KEY=$(cat /etc/wireguard/privatekey)
+    sudo chmod 600 /etc/wireguard/privatekey
+    sudo wg pubkey < /etc/wireguard/privatekey | sudo tee /etc/wireguard/publickey > /dev/null
+    HOME_PRIVATE_KEY=$(sudo cat /etc/wireguard/privatekey)
     
     echo "Creating Wireguard Config File..."
     sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOL
@@ -64,6 +65,9 @@ main() {
     get_user_input
     install_wireguard
     wireguard_setup
+    
+    echo "Enabling WireGuard to start automatically on boot..."
+    sudo systemctl enable wg-quick@wg0
     
     echo "Home Server setup for port forwarding is complete."
     echo "Please ensure to replace <Public_Key_of_VPS> in the wg0.conf file."
