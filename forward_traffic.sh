@@ -7,6 +7,8 @@ PUBLIC_NETWORK_INTERFACE="ens6"
 VPS_VPN_IP="10.0.0.1"
 HOME_SERVER_IP="10.0.0.2"
 
+CONFIG_FILE="/etc/forward-traffic.conf"
+
 check_dependencies() {
     # --- Dependency Check ---
     echo "--- Checking dependencies ---"
@@ -68,6 +70,17 @@ iptables_add() {
     else
         echo "iptables: adding rule: -t $table $*"
         sudo iptables -t "$table" -A "$@"
+    fi
+}
+
+# Helper: remove iptables rule only if it actually exists
+iptables_remove() {
+    local table="$1"; shift
+    if sudo iptables -t "$table" -C "$@" >/dev/null 2>&1; then
+        echo "iptables: removing rule: -t $table $*"
+        sudo iptables -t "$table" -D "$@"
+    else
+        echo "iptables: rule not found (skipping): -t $table $*"
     fi
 }
 
@@ -282,18 +295,153 @@ apply_rules_all() {
 }
 
 main() {
+    MODE="add"
+
+    case "${1:-}" in
+        --remove) MODE="remove" ;;
+        --list)   MODE="list"   ;;
+        --help)   usage; exit 0 ;;
+        "")       ;;
+        *) echo "Error: Unknown option '$1'. Run with --help for usage."; exit 1 ;;
+    esac
+
     require_sudo_or_root
     check_dependencies
+
+    if [[ "$MODE" == "list" ]]; then
+        list_rules
+        exit 0
+    fi
+
+    load_config
     check_variables
     get_user_input
-    
-    if [[ "$PROTOCOL" = "tcp" ]]; then
-        apply_rules
-        elif [[ "$PROTOCOL" = "udp" ]]; then
-        apply_rules
-        elif [[ "$PROTOCOL" = "all" ]]; then
-        apply_rules_all
+
+    if [[ "$MODE" == "remove" ]]; then
+        if [[ "$PROTOCOL" == "all" ]]; then
+            remove_rules_all
+        else
+            remove_rules
+        fi
+    else
+        if [[ "$PROTOCOL" == "tcp" || "$PROTOCOL" == "udp" ]]; then
+            apply_rules
+        elif [[ "$PROTOCOL" == "all" ]]; then
+            apply_rules_all
+        fi
+        save_config
     fi
 }
 
-main
+# --- Config persistence ---
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        echo "Loaded config from $CONFIG_FILE"
+        echo "  Interface : $PUBLIC_NETWORK_INTERFACE"
+        echo "  VPS VPN IP: $VPS_VPN_IP"
+        echo "  Home IP   : $HOME_SERVER_IP"
+        echo ""
+    fi
+}
+
+save_config() {
+    echo "Saving config to $CONFIG_FILE..."
+    sudo tee "$CONFIG_FILE" > /dev/null <<EOF
+PUBLIC_NETWORK_INTERFACE="$PUBLIC_NETWORK_INTERFACE"
+VPS_VPN_IP="$VPS_VPN_IP"
+HOME_SERVER_IP="$HOME_SERVER_IP"
+EOF
+    echo "Config saved."
+}
+
+# --- Rule removal ---
+
+remove_rules() {
+    echo ""
+    echo "--- Removing iptables rules ---"
+
+    for PORT in "${PORTS[@]}"; do
+        echo "Removing rules for port $PORT ($PROTOCOL)..."
+        iptables_remove nat PREROUTING -p "$PROTOCOL" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_remove nat POSTROUTING -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_remove filter FORWARD -p "$PROTOCOL" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+    done
+
+    echo "Saving iptables..."
+    sudo netfilter-persistent save
+
+    echo ""
+    echo "--- Rules removed successfully for ${#PORTS[@]} port(s)! ---"
+    echo ""
+}
+
+remove_rules_all() {
+    echo ""
+    echo "--- Removing iptables rules (TCP + UDP) ---"
+
+    for PORT in "${PORTS[@]}"; do
+        echo "Removing rules for port $PORT (TCP and UDP)..."
+        iptables_remove nat PREROUTING -p tcp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_remove nat PREROUTING -p udp --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
+        iptables_remove nat POSTROUTING -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_remove nat POSTROUTING -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+        iptables_remove filter FORWARD -p tcp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+        iptables_remove filter FORWARD -p udp -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+    done
+
+    echo "Saving iptables..."
+    sudo netfilter-persistent save
+
+    echo ""
+    echo "--- Rules removed successfully for ${#PORTS[@]} port(s)! ---"
+    echo ""
+}
+
+# --- List active rules ---
+
+list_rules() {
+    echo ""
+    echo "--- Active forwarding rules (PREROUTING DNAT) ---"
+    echo ""
+
+    DNAT_RULES=$(sudo iptables -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)
+
+    if [[ -z "$DNAT_RULES" ]]; then
+        echo "  No forwarding rules found."
+    else
+        printf "  %-8s  %-8s  %s\n" "PROTO" "PORT" "DESTINATION"
+        printf "  %-8s  %-8s  %s\n" "--------" "--------" "-----------"
+        while IFS= read -r line; do
+            proto=$(echo "$line" | awk '{print $1}')
+            dport=$(echo "$line" | grep -oP 'dpt:\K[0-9]+' || echo "?")
+            dst=$(echo "$line" | grep -oP 'to:\K\S+' || echo "?")
+            printf "  %-8s  %-8s  %s\n" "$proto" "$dport" "$dst"
+        done <<< "$DNAT_RULES"
+    fi
+    echo ""
+}
+
+# --- Help ---
+
+usage() {
+    echo ""
+    echo "Usage: $0 [--add | --remove | --list | --help]"
+    echo ""
+    echo "  (no flag)   Forward port(s) from the VPS to the home server (default)"
+    echo "  --remove    Remove previously added forwarding rules for specific port(s)"
+    echo "  --list      Show all currently active DNAT forwarding rules"
+    echo "  --help      Show this help message"
+    echo ""
+    echo "Port input formats:"
+    echo "  Single port        80"
+    echo "  Range              25565-25575"
+    echo "  Comma-separated    80,443,8080"
+    echo "  Combined           80,443,8000-8010"
+    echo ""
+    echo "Config is automatically saved to $CONFIG_FILE after first run."
+    echo ""
+}
+main "$@"
