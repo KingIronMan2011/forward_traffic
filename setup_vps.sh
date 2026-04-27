@@ -4,7 +4,25 @@ set -euo pipefail
 
 # Source shared OS abstraction
 LIB="$(dirname "$(realpath "$0")")/lib.sh"
-[[ -f "$LIB" ]] || { echo "Error: lib.sh not found next to this script." >&2; exit 1; }
+if [[ ! -f "$LIB" ]]; then
+    echo "Warning: lib.sh not found next to this script."
+    read -rp "Download it from GitHub now? [Y/n]: " _ans
+    if [[ "${_ans,,}" != "n" ]]; then
+        LIB_URL="https://raw.githubusercontent.com/KingIronMan2011/forward-traffic/main/lib.sh"
+        _DEST="$(dirname "$(realpath "$0")")/lib.sh"
+        echo "Downloading lib.sh..."
+        if command -v curl &>/dev/null; then
+            curl -fsSL "$LIB_URL" -o "$_DEST"
+        elif command -v wget &>/dev/null; then
+            wget -q "$LIB_URL" -O "$_DEST"
+        else
+            echo "Error: Neither curl nor wget found. Install one and retry." >&2; exit 1
+        fi
+        echo "Downloaded to $_DEST"
+    else
+        echo "Error: lib.sh is required to run this script." >&2; exit 1
+    fi
+fi
 # shellcheck source=lib.sh
 source "$LIB"
 
