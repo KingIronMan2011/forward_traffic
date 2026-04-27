@@ -18,13 +18,19 @@ require_sudo_or_root() {
 
 check_dependencies() {
     echo "--- Checking dependencies ---"
-    for pkg in netfilter-persistent iptables; do
-        if ! command -v "$pkg" &>/dev/null; then
-            echo "'$pkg' not found — installing..."
-            sudo apt-get update -qq &>/dev/null
-            sudo apt-get install -y -qq "$pkg" &>/dev/null
-        fi
-    done
+    # iptables-persistent is the apt package; it provides the netfilter-persistent command
+    if ! command -v netfilter-persistent &>/dev/null; then
+        echo "'iptables-persistent' not found — installing..."
+        sudo apt-get update -qq &>/dev/null
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent &>/dev/null
+    fi
+    if ! command -v iptables &>/dev/null; then
+        echo "'iptables' not found — installing..."
+        sudo apt-get update -qq &>/dev/null
+        sudo apt-get install -y -qq iptables &>/dev/null
+    fi
+    # Ensure the rules directory exists so iptables-save never fails silently
+    sudo mkdir -p /etc/iptables
     echo "All dependencies satisfied."; echo
 }
 
@@ -162,8 +168,8 @@ manage_rules() {
         iptables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     fi
 
-    echo "Saving iptables..."
-    sudo netfilter-persistent save
+    echo "Saving iptables rules to /etc/iptables/rules.v4..."
+    sudo iptables-save | sudo tee /etc/iptables/rules.v4 > /dev/null
     printf "\n--- Done: %d port(s) %sed. ---\n\n" "${#PORTS[@]}" "$action"
 }
 
