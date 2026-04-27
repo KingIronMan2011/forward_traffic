@@ -2,15 +2,13 @@
 
 set -euo pipefail
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# Source shared OS abstraction
+LIB="$(dirname "$(realpath "$0")")/lib.sh"
+[[ -f "$LIB" ]] || { echo "Error: lib.sh not found next to this script." >&2; exit 1; }
+# shellcheck source=lib.sh
+source "$LIB"
 
-install_wireguard() {
-    echo "--- Installing WireGuard ---"
-    sudo apt-get update -qq &>/dev/null
-    sudo apt-get install -y -qq wireguard &>/dev/null
-    sudo mkdir -p /etc/wireguard
-    echo "WireGuard installed."
-}
+# ─── WireGuard config ─────────────────────────────────────────────────────────
 
 wireguard_setup() {
     echo "--- Generating WireGuard keys ---"
@@ -38,12 +36,12 @@ EOF
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null || {
-        echo "Error: root or sudo required." >&2; exit 1
-    }
+    require_sudo_or_root
+    detect_os
 
     echo "Home server setup for WireGuard port forwarding."
     echo
+
     while true; do
         read -rp "Public IP address of the VPS: " VPS_PUBLIC_IP
         [[ "$VPS_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break || echo "Invalid IP format. Try again."
@@ -51,14 +49,16 @@ main() {
 
     install_wireguard
     wireguard_setup
-    sudo systemctl enable wg-quick@wg0
+    systemd_enable wg-quick@wg0
 
     echo
     echo "✓ Home server setup complete."
     echo "  1. Copy your VPS public key into /etc/wireguard/wg0.conf"
     echo "     (replace <Public_Key_of_VPS>)"
     echo "  2. Run: sudo wg-quick up wg0"
-    echo "  Your home server public key (share with VPS): $(sudo cat /etc/wireguard/publickey)"
+    echo
+    echo "  Your home server public key (share with VPS):"
+    sudo cat /etc/wireguard/publickey
 }
 
 main

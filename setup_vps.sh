@@ -2,15 +2,13 @@
 
 set -euo pipefail
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# Source shared OS abstraction
+LIB="$(dirname "$(realpath "$0")")/lib.sh"
+[[ -f "$LIB" ]] || { echo "Error: lib.sh not found next to this script." >&2; exit 1; }
+# shellcheck source=lib.sh
+source "$LIB"
 
-install_wireguard() {
-    echo "--- Installing WireGuard ---"
-    sudo apt-get update -qq &>/dev/null
-    sudo apt-get install -y -qq wireguard &>/dev/null
-    sudo mkdir -p /etc/wireguard
-    echo "WireGuard installed."
-}
+# ─── WireGuard config ─────────────────────────────────────────────────────────
 
 wireguard_setup() {
     echo "--- Generating WireGuard keys ---"
@@ -36,21 +34,15 @@ AllowedIPs = 10.0.0.2/32
 EOF
 }
 
-persist_ip_forwarding() {
-    sudo sysctl -w net.ipv4.ip_forward=1 &>/dev/null
-    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null \
-        || echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf > /dev/null
-}
-
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null || {
-        echo "Error: root or sudo required." >&2; exit 1
-    }
+    require_sudo_or_root
+    detect_os
 
     echo "VPS setup for WireGuard port forwarding."
     echo
+
     while true; do
         read -rp "Public network interface (e.g. eth0, ens3): " PUBLIC_IFACE
         ip link show "$PUBLIC_IFACE" &>/dev/null && break || echo "Interface not found. Try again."
@@ -58,15 +50,17 @@ main() {
 
     install_wireguard
     wireguard_setup
-    persist_ip_forwarding
-    sudo systemctl enable wg-quick@wg0
+    enable_ip_forwarding
+    systemd_enable wg-quick@wg0
 
     echo
     echo "✓ VPS setup complete."
     echo "  1. Copy your home server's public key into /etc/wireguard/wg0.conf"
     echo "     (replace <Public_Key_of_Home_Server>)"
     echo "  2. Run: sudo wg-quick up wg0"
-    echo "  Your VPS public key (share with home server): $(sudo cat /etc/wireguard/publickey)"
+    echo
+    echo "  Your VPS public key (share with home server):"
+    sudo cat /etc/wireguard/publickey
 }
 
 main

@@ -2,58 +2,29 @@
 
 set -euo pipefail
 
+# Source shared OS abstraction
+LIB="$(dirname "$(realpath "$0")")/lib.sh"
+[[ -f "$LIB" ]] || { echo "Error: lib.sh not found next to this script." >&2; exit 1; }
+# shellcheck source=lib.sh
+source "$LIB"
+
 # --- Configuration (overridden by config file if present) ---
 PUBLIC_NETWORK_INTERFACE="ens6"
 VPS_VPN_IP="10.0.0.1"
 HOME_SERVER_IP="10.0.0.2"
 CONFIG_FILE="/etc/forward-traffic.conf"
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-require_sudo_or_root() {
-    [[ "$EUID" -eq 0 ]] || command -v sudo &>/dev/null || {
-        echo "Error: root or sudo required." >&2; exit 1
-    }
-}
+# ─── Dependency check ─────────────────────────────────────────────────────────
 
 check_dependencies() {
     echo "--- Checking dependencies ---"
-    # iptables-persistent is the apt package; it provides the netfilter-persistent command
-    if ! command -v netfilter-persistent &>/dev/null; then
-        echo "'iptables-persistent' not found — installing..."
-        sudo apt-get update -qq &>/dev/null
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent &>/dev/null
-    fi
+    detect_os
     if ! command -v iptables &>/dev/null; then
         echo "'iptables' not found — installing..."
-        sudo apt-get update -qq &>/dev/null
-        sudo apt-get install -y -qq iptables &>/dev/null
+        pkg_install iptables
     fi
-    # Ensure the rules directory exists so iptables-save never fails silently
-    sudo mkdir -p /etc/iptables
+    install_iptables_persistence
     echo "All dependencies satisfied."; echo
-}
-
-validate_ip() {
-    local ip="$1"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "Error: Invalid IP: $ip" >&2; exit 1; }
-    IFS='.' read -r a b c d <<< "$ip"
-    for oct in "$a" "$b" "$c" "$d"; do
-        ((oct >= 0 && oct <= 255)) || { echo "Error: Invalid IP: $ip" >&2; exit 1; }
-    done
-}
-
-check_variables() {
-    [[ -n "$PUBLIC_NETWORK_INTERFACE" && -n "$VPS_VPN_IP" && -n "$HOME_SERVER_IP" ]] || {
-        echo "Error: PUBLIC_NETWORK_INTERFACE, VPS_VPN_IP and HOME_SERVER_IP must all be set." >&2; exit 1
-    }
-    validate_ip "$VPS_VPN_IP"
-    validate_ip "$HOME_SERVER_IP"
-    if ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null; then
-        echo "Warning: Interface '$PUBLIC_NETWORK_INTERFACE' not found."
-        read -rp "Continue anyway? [y/N]: " ans
-        [[ "${ans,,}" == "y" ]] || { echo "Aborting."; exit 1; }
-    fi
 }
 
 # ─── Config persistence ───────────────────────────────────────────────────────
@@ -75,6 +46,21 @@ VPS_VPN_IP="$VPS_VPN_IP"
 HOME_SERVER_IP="$HOME_SERVER_IP"
 EOF
     echo "Config saved."
+}
+
+# ─── Variable / interface check ───────────────────────────────────────────────
+
+check_variables() {
+    [[ -n "$PUBLIC_NETWORK_INTERFACE" && -n "$VPS_VPN_IP" && -n "$HOME_SERVER_IP" ]] || {
+        echo "Error: PUBLIC_NETWORK_INTERFACE, VPS_VPN_IP and HOME_SERVER_IP must all be set." >&2; exit 1
+    }
+    validate_ip "$VPS_VPN_IP"
+    validate_ip "$HOME_SERVER_IP"
+    if ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null; then
+        echo "Warning: Interface '$PUBLIC_NETWORK_INTERFACE' not found."
+        read -rp "Continue anyway? [y/N]: " ans
+        [[ "${ans,,}" == "y" ]] || { echo "Aborting."; exit 1; }
+    fi
 }
 
 # ─── Port parsing ─────────────────────────────────────────────────────────────
@@ -147,10 +133,7 @@ manage_rules() {
 
     if [[ "$action" == "add" ]]; then
         echo "--- Applying iptables rules ---"
-        echo "Enabling IP forwarding..."
-        sudo sysctl -w net.ipv4.ip_forward=1 &>/dev/null
-        echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-forward.conf &>/dev/null
-        sudo sysctl --system &>/dev/null
+        enable_ip_forwarding
     else
         echo "--- Removing iptables rules ---"
     fi
@@ -168,8 +151,7 @@ manage_rules() {
         iptables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     fi
 
-    echo "Saving iptables rules to /etc/iptables/rules.v4..."
-    sudo iptables-save | sudo tee /etc/iptables/rules.v4 > /dev/null
+    save_iptables
     printf "\n--- Done: %d port(s) %sed. ---\n\n" "${#PORTS[@]}" "$action"
 }
 
@@ -189,7 +171,7 @@ list_rules() {
         while IFS= read -r line; do
             proto=$(awk '{print $1}' <<< "$line")
             dport=$(grep -oP 'dpt:\K[0-9]+' <<< "$line" || echo "?")
-            dst=$(grep -oP 'to:\K\S+'    <<< "$line" || echo "?")
+            dst=$(grep -oP 'to:\K\S+'       <<< "$line" || echo "?")
             printf "  %-8s  %-8s  %s\n" "$proto" "$dport" "$dst"
         done <<< "$rules"
     fi
