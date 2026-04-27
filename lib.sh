@@ -214,3 +214,86 @@ validate_ip() {
         ((oct >= 0 && oct <= 255)) || { echo "Error: Invalid IP octet in: $ip" >&2; exit 1; }
     done
 }
+
+# ─── UFW support ──────────────────────────────────────────────────────────────
+
+# Returns 0 if UFW is installed and active
+ufw_active() {
+    command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"
+}
+
+# Call once during setup to prepare UFW for WireGuard + forwarding
+handle_ufw_for_wireguard() {
+    ufw_active || return 0
+    echo "UFW is active — configuring for WireGuard..."
+    sudo ufw allow 51820/udp &>/dev/null
+    # Allow forwarded traffic through UFW
+    sudo sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    sudo ufw reload &>/dev/null
+    echo "UFW: port 51820/udp allowed, forward policy set to ACCEPT."
+}
+
+# Add or remove a single port/proto in UFW if it is active
+# ufw_manage_port <add|remove> <port> <proto>
+ufw_manage_port() {
+    ufw_active || return 0
+    local action="$1" port="$2" proto="$3"
+    if [[ "$action" == "add" ]]; then
+        sudo ufw allow "$port/$proto" &>/dev/null \
+            && echo "UFW: allowed $port/$proto" \
+            || echo "UFW: warning — could not allow $port/$proto"
+    else
+        sudo ufw delete allow "$port/$proto" &>/dev/null \
+            && echo "UFW: removed $port/$proto" \
+            || echo "UFW: warning — could not remove $port/$proto"
+    fi
+}
+
+# ─── SSH key exchange ─────────────────────────────────────────────────────────
+
+# Offer to SSH to the peer machine and swap WireGuard public keys automatically.
+# Usage: auto_key_exchange <local_placeholder> <remote_placeholder> <local_pubkey_file>
+#   local_placeholder  — string in the REMOTE machine's wg0.conf to replace (e.g. "<Public_Key_of_VPS>")
+#   remote_placeholder — string in the LOCAL machine's wg0.conf to replace (e.g. "<Public_Key_of_Home_Server>")
+#   local_pubkey_file  — path to this machine's public key file
+auto_key_exchange() {
+    local local_ph="$1" remote_ph="$2" local_pubkey_file="$3"
+    local local_pubkey
+    local_pubkey=$(sudo cat "$local_pubkey_file")
+
+    echo
+    echo "--- Automatic Key Exchange (optional) ---"
+    echo "  You can SSH into the peer machine now to insert keys on both sides automatically."
+    read -rp "  SSH to peer machine to exchange keys? [y/N]: " ans
+    [[ "${ans,,}" == "y" ]] || { echo "  Skipped — insert keys manually."; return 0; }
+
+    read -rp "  Peer SSH target (user@host): " SSH_TARGET
+    read -rp "  SSH port [22]: " SSH_PORT
+    SSH_PORT="${SSH_PORT:-22}"
+
+    echo "  Connecting to $SSH_TARGET..."
+
+    # 1. Insert our public key into peer's wg0.conf
+    # 2. Read back peer's public key
+    local remote_pubkey
+    remote_pubkey=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
+        "$SSH_TARGET" \
+        "sudo sed -i 's|${local_ph}|${local_pubkey}|' /etc/wireguard/wg0.conf \
+         && sudo cat /etc/wireguard/publickey" 2>/dev/null) || {
+        echo "  Warning: SSH command failed. Exchange keys manually." >&2
+        return 1
+    }
+
+    if [[ -z "$remote_pubkey" ]]; then
+        echo "  Warning: Could not read remote public key. Check /etc/wireguard/publickey on peer." >&2
+        return 1
+    fi
+
+    # Insert remote's public key into our local wg0.conf
+    sudo sed -i "s|${remote_ph}|${remote_pubkey}|" /etc/wireguard/wg0.conf
+
+    echo "  ✓ Keys exchanged successfully."
+    echo "    Peer public key: $remote_pubkey"
+    echo "    Inserted into local /etc/wireguard/wg0.conf"
+    echo "    Remote /etc/wireguard/wg0.conf updated with our public key."
+}

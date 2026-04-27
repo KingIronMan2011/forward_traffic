@@ -69,6 +69,7 @@ main() {
     install_wireguard
     wireguard_setup
     enable_ip_forwarding
+    handle_ufw_for_wireguard
     systemd_enable wg-quick@wg0
 
     echo
@@ -79,6 +80,11 @@ main() {
     echo
     echo "  Your VPS public key (share with home server):"
     sudo cat /etc/wireguard/publickey
+
+    auto_key_exchange \
+        "<Public_Key_of_VPS>" \
+        "<Public_Key_of_Home_Server>" \
+        /etc/wireguard/publickey
 }
 
 main

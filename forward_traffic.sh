@@ -31,6 +31,7 @@ PUBLIC_NETWORK_INTERFACE="ens6"
 VPS_VPN_IP="10.0.0.1"
 HOME_SERVER_IP="10.0.0.2"
 CONFIG_FILE="/etc/forward-traffic.conf"
+DRY_RUN=false
 
 # ─── Dependency check ─────────────────────────────────────────────────────────
 
@@ -42,6 +43,7 @@ check_dependencies() {
         pkg_install iptables
     fi
     install_iptables_persistence
+    handle_ufw_for_wireguard
     echo "All dependencies satisfied."; echo
 }
 
@@ -131,6 +133,11 @@ get_user_input() {
 # iptables_rule <add|remove> <table> <chain> [rule args...]
 iptables_rule() {
     local action="$1" table="$2"; shift 2
+    if $DRY_RUN; then
+        local verb; [[ "$action" == "add" ]] && verb="-A" || verb="-D"
+        echo "[dry-run] iptables -t $table $verb $*"
+        return
+    fi
     if sudo iptables -t "$table" -C "$@" &>/dev/null; then
         [[ "$action" == "add" ]] \
             && echo "iptables: already exists (skip): -t $table $*" \
@@ -162,6 +169,7 @@ manage_rules() {
             iptables_rule "$action" nat    PREROUTING  -p "$proto" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
             iptables_rule "$action" nat    POSTROUTING -p "$proto" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
             iptables_rule "$action" filter FORWARD     -p "$proto" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+            ufw_manage_port "$action" "$PORT" "$proto"
         done
     done
 
@@ -169,8 +177,12 @@ manage_rules() {
         iptables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
     fi
 
-    save_iptables
-    printf "\n--- Done: %d port(s) %sed. ---\n\n" "${#PORTS[@]}" "$action"
+    if $DRY_RUN; then
+        printf "\n--- [dry-run] %d port(s) would be %sed (no changes made). ---\n\n" "${#PORTS[@]}" "$action"
+    else
+        save_iptables
+        printf "\n--- Done: %d port(s) %sed. ---\n\n" "${#PORTS[@]}" "$action"
+    fi
 }
 
 # ─── List active rules ────────────────────────────────────────────────────────
@@ -205,6 +217,7 @@ Usage: $0 [--remove | --list | --help]
 
   (no flag)   Forward port(s) from the VPS to the home server
   --remove    Remove previously added forwarding rules
+  --dry-run   Show what rules would be applied without making any changes
   --list      Show all currently active DNAT forwarding rules
   --help      Show this help message
 
@@ -220,7 +233,8 @@ EOF
 main() {
     local mode="add"
     case "${1:-}" in
-        --remove) mode="remove" ;;
+        --remove)   mode="remove"   ;;
+        --dry-run)  DRY_RUN=true   ;;
         --list)   mode="list"   ;;
         --help)   usage; exit 0 ;;
         "")       ;;
@@ -240,7 +254,7 @@ main() {
     [[ "$PROTOCOL" == "all" ]] && protos=(tcp udp)
 
     manage_rules "$mode" "${protos[@]}"
-    [[ "$mode" == "add" ]] && save_config || true
+    [[ "$mode" == "add" ]] && ! $DRY_RUN && save_config || true
 }
 
 main "$@"
