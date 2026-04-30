@@ -28,7 +28,7 @@ source "$LIB"
 
 # ─── Defaults (overridden by config file) ─────────────────────────────────────
 
-PUBLIC_NETWORK_INTERFACE="ens6"
+PUBLIC_NETWORK_INTERFACE=""  # auto-detected at runtime
 VPS_VPN_IP="10.0.0.1"
 HOME_SERVER_IP="10.0.0.2"
 # IPv6 WireGuard VPN addresses (fd00::/64 is a private ULA prefix)
@@ -149,16 +149,27 @@ select_forward_target() {
 # ─── Variable / interface check ───────────────────────────────────────────────
 
 check_variables() {
-    [[ -n "$PUBLIC_NETWORK_INTERFACE" && -n "$VPS_VPN_IP" && -n "$HOME_SERVER_IP" ]] || {
-        echo "Error: PUBLIC_NETWORK_INTERFACE, VPS_VPN_IP and HOME_SERVER_IP must all be set." >&2; exit 1
+    [[ -n "$VPS_VPN_IP" && -n "$HOME_SERVER_IP" ]] || {
+        echo "Error: VPS_VPN_IP and HOME_SERVER_IP must be set." >&2; exit 1
     }
     validate_ip "$VPS_VPN_IP"
     validate_ip "$HOME_SERVER_IP"
-    if ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null; then
-        echo "Warning: Interface '$PUBLIC_NETWORK_INTERFACE' not found."
-        read -rp "Continue anyway? [y/N]: " ans
-        [[ "${ans,,}" == "y" ]] || { echo "Aborting."; exit 1; }
+
+    # Auto-detect interface if not already set (e.g. from config file)
+    if [[ -z "$PUBLIC_NETWORK_INTERFACE" ]]; then
+        detect_public_interface
     fi
+
+    # Confirm with user if detection failed or interface is not found
+    if [[ -z "$PUBLIC_NETWORK_INTERFACE" ]] || ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null 2>&1; then
+        echo "Warning: Interface '${PUBLIC_NETWORK_INTERFACE:-<none>}' not found or unreachable."
+        read -rp "Enter interface name manually (e.g. eth0, ens3): " PUBLIC_NETWORK_INTERFACE
+        ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null || {
+            echo "Error: Interface '$PUBLIC_NETWORK_INTERFACE' still not found." >&2; exit 1
+        }
+    fi
+
+    echo "Using interface: $PUBLIC_NETWORK_INTERFACE"
 }
 
 # ─── Port parsing ─────────────────────────────────────────────────────────────

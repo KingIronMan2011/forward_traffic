@@ -215,6 +215,47 @@ validate_ip() {
     done
 }
 
+# ─── Public interface detection ───────────────────────────────────────────────
+
+# Detects the outbound public network interface by probing the default route.
+# Sets PUBLIC_NETWORK_INTERFACE. Falls back through multiple strategies.
+detect_public_interface() {
+    local iface=""
+
+    # Strategy 1: trace the actual route to a public IP (most reliable)
+    if command -v ip &>/dev/null; then
+        iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    fi
+
+    # Strategy 2: default route table entry
+    if [[ -z "$iface" ]] && command -v ip &>/dev/null; then
+        iface=$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    fi
+
+    # Strategy 3: first UP non-loopback, non-virtual interface
+    if [[ -z "$iface" ]] && command -v ip &>/dev/null; then
+        iface=$(ip -o link show 2>/dev/null             | awk -F': ' '$3 ~ /UP/ && $2 !~ /^(lo|wg|docker|virbr|veth|br-|tun|tap)/ {print $2}'             | head -1)
+    fi
+
+    # Strategy 4: legacy route command (older systems without iproute2)
+    if [[ -z "$iface" ]] && command -v route &>/dev/null; then
+        iface=$(route -n 2>/dev/null | awk '$1=="0.0.0.0"{print $8; exit}')
+    fi
+
+    # Strategy 5: /proc/net/route (kernel-level fallback, always available)
+    if [[ -z "$iface" ]] && [[ -r /proc/net/route ]]; then
+        iface=$(awk '$2=="00000000" && $1!="lo"{print $1; exit}' /proc/net/route)
+    fi
+
+    if [[ -n "$iface" ]]; then
+        PUBLIC_NETWORK_INTERFACE="$iface"
+        echo "Auto-detected public interface: $iface"
+    else
+        echo "Warning: Could not auto-detect public interface." >&2
+        PUBLIC_NETWORK_INTERFACE=""
+    fi
+}
+
 # ─── UFW support ──────────────────────────────────────────────────────────────
 
 # Returns 0 if UFW is installed and active

@@ -76,10 +76,22 @@ main() {
     echo "VPS setup for WireGuard port forwarding."
     echo
 
-    while true; do
-        read -rp "Public network interface (e.g. eth0, ens3): " PUBLIC_IFACE
-        ip link show "$PUBLIC_IFACE" &>/dev/null && break || echo "Interface not found. Try again."
-    done
+    detect_public_interface
+    if [[ -n "$PUBLIC_NETWORK_INTERFACE" ]]; then
+        read -rp "Public interface detected as '$PUBLIC_NETWORK_INTERFACE'. Use it? [Y/n]: " _conf
+        if [[ "${_conf,,}" == "n" ]]; then
+            while true; do
+                read -rp "Enter interface name manually (e.g. eth0, ens3): " PUBLIC_NETWORK_INTERFACE
+                ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null && break || echo "Interface not found. Try again."
+            done
+        fi
+    else
+        while true; do
+            read -rp "Could not auto-detect. Enter interface name (e.g. eth0, ens3): " PUBLIC_NETWORK_INTERFACE
+            ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null && break || echo "Interface not found. Try again."
+        done
+    fi
+    PUBLIC_IFACE="$PUBLIC_NETWORK_INTERFACE"
 
     read -rp "Enable IPv6 dual-stack WireGuard? [y/N]: " ans_v6
     [[ "${ans_v6,,}" == "y" ]] && ENABLE_IPv6=true || true
