@@ -384,6 +384,7 @@ main() {
     if [[ "$mode" == "list" ]]; then list_rules; exit 0; fi
 
     load_config
+    detect_wg_config_values   # fill in VPS/home IPs from wg0.conf if not in config
     check_variables
     get_user_input
 

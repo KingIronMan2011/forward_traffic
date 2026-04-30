@@ -41,11 +41,11 @@ wireguard_setup() {
     privkey=$(sudo cat /etc/wireguard/privatekey)
 
     # Build Address and AllowedIPs with optional IPv6
-    local addr="10.0.0.2/24"
-    local peer_allowed="10.0.0.1/32"
+    local addr="${WG_VPN_IP_HOME}/24"
+    local peer_allowed="${WG_VPN_IP_VPS}/32"
     if $ENABLE_IPv6; then
-        addr="10.0.0.2/24, ${HOME_SERVER_IPv6}/64"
-        peer_allowed="10.0.0.1/32, ${VPS_VPN_IPv6}/128"
+        addr="${WG_VPN_IP_HOME}/24, ${HOME_SERVER_IPv6}/64"
+        peer_allowed="${WG_VPN_IP_VPS}/32, ${VPS_VPN_IPv6}/128"
     fi
 
     echo "--- Creating /etc/wireguard/wg0.conf ---"
@@ -57,7 +57,7 @@ PrivateKey = ${privkey}
 [Peer]
 # Replace with the output of: cat /etc/wireguard/publickey  (on the VPS)
 PublicKey           = <Public_Key_of_VPS>
-Endpoint            = ${VPS_PUBLIC_IP}:51820
+Endpoint            = ${VPS_PUBLIC_IP}:${WG_PORT}
 AllowedIPs          = ${peer_allowed}
 PersistentKeepalive = 25
 EOF
@@ -72,11 +72,22 @@ main() {
     echo "Home server setup for WireGuard port forwarding."
     echo
 
-    while true; do
+    # ── Auto-detect what we can ───────────────────────────────────────────────
+    detect_vpn_subnet
+    backup_existing_wg_config
+
+    # ── VPS public IP ─────────────────────────────────────────────────────────
+    read -rp "Public IP address of the VPS (from setup_vps.sh output): " VPS_PUBLIC_IP
+    while [[ ! "$VPS_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
+        echo "Invalid IP format. Try again."
         read -rp "Public IP address of the VPS: " VPS_PUBLIC_IP
-        [[ "$VPS_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break || echo "Invalid IP format. Try again."
     done
 
+    # ── WireGuard port ────────────────────────────────────────────────────────
+    read -rp "WireGuard listen port on VPS [51820]: " WG_PORT_INPUT
+    WG_PORT="${WG_PORT_INPUT:-51820}"
+
+    # ── IPv6 ─────────────────────────────────────────────────────────────────
     read -rp "Enable IPv6 dual-stack WireGuard? [y/N]: " ans_v6
     [[ "${ans_v6,,}" == "y" ]] && ENABLE_IPv6=true || true
 

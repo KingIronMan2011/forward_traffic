@@ -215,6 +215,141 @@ validate_ip() {
     done
 }
 
+# ─── VPS public IP detection ──────────────────────────────────────────────────
+
+# Detects this machine's public IPv4 address using multiple external services.
+# Sets VPS_PUBLIC_IP.
+detect_vps_public_ip() {
+    local ip=""
+    local services=(
+        "https://api4.my-ip.io/ip"
+        "https://ipv4.icanhazip.com"
+        "https://checkip.amazonaws.com"
+        "https://ipecho.net/plain"
+    )
+
+    for svc in "${services[@]}"; do
+        if command -v curl &>/dev/null; then
+            ip=$(curl -fsSL --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]') && break
+        elif command -v wget &>/dev/null; then
+            ip=$(wget -qO- --timeout=5 "$svc" 2>/dev/null | tr -d '[:space:]') && break
+        fi
+    done
+
+    # Validate it looks like an IPv4
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        VPS_PUBLIC_IP="$ip"
+        echo "Auto-detected VPS public IP: $ip"
+    else
+        VPS_PUBLIC_IP=""
+        echo "Warning: Could not auto-detect VPS public IP." >&2
+    fi
+}
+
+# ─── WireGuard port detection ──────────────────────────────────────────────────
+
+WG_PORT=51820
+
+# Checks if WG_PORT (default 51820) is already in use (UDP).
+# If so, scans upward from 51820 to find the next free port and sets WG_PORT.
+detect_wireguard_port() {
+    local port=51820
+    while true; do
+        local in_use=false
+        if command -v ss &>/dev/null; then
+            ss -ulnp 2>/dev/null | grep -q ":${port} " && in_use=true
+        elif command -v netstat &>/dev/null; then
+            netstat -ulnp 2>/dev/null | grep -q ":${port} " && in_use=true
+        fi
+        if ! $in_use; then
+            WG_PORT="$port"
+            if [[ "$port" != "51820" ]]; then
+                echo "Port 51820 is in use — using $WG_PORT instead."
+            else
+                echo "WireGuard port: $WG_PORT (available)"
+            fi
+            return
+        fi
+        echo "Port $port/udp is in use, trying $((port+1))..."
+        ((port++))
+        (( port > 65535 )) && { echo "Error: No free UDP port found." >&2; exit 1; }
+    done
+}
+
+# ─── VPN subnet detection ─────────────────────────────────────────────────────
+
+WG_VPN_SUBNET="10.0.0"        # base without trailing .0/24
+WG_VPN_IP_VPS="10.0.0.1"
+WG_VPN_IP_HOME="10.0.0.2"
+
+# Checks if 10.0.0.0/24 conflicts with an existing route.
+# If so, tries 10.0.1.x, 10.0.2.x ... 10.0.254.x until a free subnet is found.
+detect_vpn_subnet() {
+    local base third_octet=0
+
+    for third_octet in {0..254}; do
+        base="10.0.${third_octet}"
+        local conflict=false
+        if command -v ip &>/dev/null; then
+            ip route show 2>/dev/null | grep -q "^${base}\." && conflict=true
+        elif [[ -r /proc/net/route ]]; then
+            # Convert dotted decimal to little-endian hex for /proc/net/route
+            awk -v b="$base" 'BEGIN{
+                n=split(b,a,".");
+                printf "%02X%02X%02X00\n",a[3]+0,a[2]+0,a[1]+0
+            }' | while read -r hex; do
+                grep -qi "^[^ ]* ${hex}" /proc/net/route && conflict=true
+            done
+        fi
+        if ! $conflict; then
+            WG_VPN_SUBNET="$base"
+            WG_VPN_IP_VPS="${base}.1"
+            WG_VPN_IP_HOME="${base}.2"
+            if [[ "$third_octet" != "0" ]]; then
+                echo "Subnet 10.0.0.0/24 conflicts — using ${base}.0/24 instead."
+            else
+                echo "VPN subnet: ${base}.0/24 (no conflicts)"
+            fi
+            return
+        fi
+    done
+    echo "Error: Could not find a free 10.0.x.0/24 subnet." >&2; exit 1
+}
+
+# ─── Existing WireGuard config detection ──────────────────────────────────────
+
+# If /etc/wireguard/wg0.conf already exists, back it up with a timestamp
+# and warn the user before the setup script overwrites it.
+backup_existing_wg_config() {
+    local conf="/etc/wireguard/wg0.conf"
+    [[ -f "$conf" ]] || return 0
+    local backup="${conf}.bak.$(date +%Y%m%d_%H%M%S)"
+    echo "Warning: $conf already exists."
+    sudo cp "$conf" "$backup"
+    echo "  Backed up to: $backup"
+}
+
+# Read VPS_VPN_IP and HOME_SERVER_IP from an existing wg0.conf.
+# This allows forward_traffic.sh to skip prompting on systems already set up.
+detect_wg_config_values() {
+    local conf="/etc/wireguard/wg0.conf"
+    [[ -f "$conf" ]] || return 0
+
+    local addr
+    addr=$(grep -oP '^Address\s*=\s*\K[^/,]+' "$conf" 2>/dev/null | head -1 | xargs)
+    if [[ -n "$addr" ]]; then
+        VPS_VPN_IP="$addr"
+        echo "Read VPS VPN IP from wg0.conf: $VPS_VPN_IP"
+    fi
+
+    local peer_allowed
+    peer_allowed=$(awk '/^\[Peer\]/{p=1} p && /^AllowedIPs/{gsub("/.*","",$3); print $3; exit}' "$conf" 2>/dev/null | xargs)
+    if [[ -n "$peer_allowed" ]]; then
+        HOME_SERVER_IP="$peer_allowed"
+        echo "Read home server IP from wg0.conf: $HOME_SERVER_IP"
+    fi
+}
+
 # ─── Public interface detection ───────────────────────────────────────────────
 
 # Detects the outbound public network interface by probing the default route.
