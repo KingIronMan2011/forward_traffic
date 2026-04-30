@@ -26,6 +26,10 @@ fi
 # shellcheck source=lib.sh
 source "$LIB"
 
+ENABLE_IPv6=false
+VPS_VPN_IPv6="fd00::1"
+HOME_SERVER_IPv6="fd00::2"
+
 # ─── WireGuard config ─────────────────────────────────────────────────────────
 
 wireguard_setup() {
@@ -36,17 +40,25 @@ wireguard_setup() {
     local privkey
     privkey=$(sudo cat /etc/wireguard/privatekey)
 
+    # Build Address and AllowedIPs with optional IPv6
+    local addr="10.0.0.2/24"
+    local peer_allowed="10.0.0.1/32"
+    if $ENABLE_IPv6; then
+        addr="10.0.0.2/24, ${HOME_SERVER_IPv6}/64"
+        peer_allowed="10.0.0.1/32, ${VPS_VPN_IPv6}/128"
+    fi
+
     echo "--- Creating /etc/wireguard/wg0.conf ---"
     sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
 [Interface]
-Address    = 10.0.0.2/24
+Address    = ${addr}
 PrivateKey = ${privkey}
 
 [Peer]
 # Replace with the output of: cat /etc/wireguard/publickey  (on the VPS)
 PublicKey           = <Public_Key_of_VPS>
 Endpoint            = ${VPS_PUBLIC_IP}:51820
-AllowedIPs          = 10.0.0.1/32
+AllowedIPs          = ${peer_allowed}
 PersistentKeepalive = 25
 EOF
 }
@@ -64,6 +76,16 @@ main() {
         read -rp "Public IP address of the VPS: " VPS_PUBLIC_IP
         [[ "$VPS_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break || echo "Invalid IP format. Try again."
     done
+
+    read -rp "Enable IPv6 dual-stack WireGuard? [y/N]: " ans_v6
+    [[ "${ans_v6,,}" == "y" ]] && ENABLE_IPv6=true || true
+
+    if $ENABLE_IPv6; then
+        read -rp "VPS WireGuard IPv6 address [fd00::1]: " v6_vps
+        [[ -n "$v6_vps" ]] && VPS_VPN_IPv6="$v6_vps" || true
+        read -rp "Home server WireGuard IPv6 address [fd00::2]: " v6_home
+        [[ -n "$v6_home" ]] && HOME_SERVER_IPv6="$v6_home" || true
+    fi
 
     install_wireguard
     wireguard_setup

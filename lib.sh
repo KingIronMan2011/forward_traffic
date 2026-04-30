@@ -297,3 +297,145 @@ auto_key_exchange() {
     echo "    Inserted into local /etc/wireguard/wg0.conf"
     echo "    Remote /etc/wireguard/wg0.conf updated with our public key."
 }
+
+# ─── Audit logging ────────────────────────────────────────────────────────────
+
+AUDIT_LOG="/var/log/forward-traffic.log"
+
+# audit_log <action> <proto> <ports_str> <target_ip>
+audit_log() {
+    local action="$1" proto="$2" ports="$3" target="$4"
+    local ts user
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    user=$(logname 2>/dev/null || echo "${SUDO_USER:-${USER:-unknown}}")
+    local entry="$ts | ${action^^} | $proto | $ports | $target | user:$user"
+    echo "$entry" | sudo tee -a "$AUDIT_LOG" > /dev/null
+}
+
+view_audit_log() {
+    local n="${1:-50}"
+    echo
+    echo "--- Audit Log ($AUDIT_LOG) ---"
+    echo
+    if [[ ! -f "$AUDIT_LOG" ]]; then
+        echo "  No audit log found."
+    else
+        printf "  %-19s  %-7s  %-5s  %-20s  %-15s  %s\n" \
+            "TIMESTAMP" "ACTION" "PROTO" "PORTS" "TARGET" "USER"
+        printf "  %-19s  %-7s  %-5s  %-20s  %-15s  %s\n" \
+            "-------------------" "-------" "-----" "--------------------" "---------------" "----"
+        if [[ "$n" == "all" ]]; then
+            cat "$AUDIT_LOG"
+        else
+            tail -n "$n" "$AUDIT_LOG"
+        fi | while IFS='|' read -r ts action proto ports target user; do
+            printf "  %-19s  %-7s  %-5s  %-20s  %-15s  %s\n" \
+                "${ts// /}" "${action// /}" "${proto// /}" "${ports// /}" "${target// /}" "${user// /}"
+        done
+    fi
+    echo
+}
+
+# ─── Firewalld support ────────────────────────────────────────────────────────
+
+firewalld_active() {
+    command -v firewall-cmd &>/dev/null && sudo firewall-cmd --state &>/dev/null
+}
+
+# firewalld_manage_port <add|remove> <port> <proto> <home_ip> <vps_ip>
+firewalld_manage_port() {
+    firewalld_active || return 0
+    local action="$1" port="$2" proto="$3" home_ip="$4"
+    local rule="port=${port}:proto=${proto}:toport=${port}:toaddr=${home_ip}"
+
+    if [[ "$action" == "add" ]]; then
+        sudo firewall-cmd --add-forward-port="$rule" &>/dev/null \
+            && echo "firewalld: forward-port added: $port/$proto → $home_ip" \
+            || echo "firewalld: warning — could not add forward-port $port/$proto"
+        sudo firewall-cmd --add-masquerade &>/dev/null || true
+    else
+        sudo firewall-cmd --remove-forward-port="$rule" &>/dev/null \
+            && echo "firewalld: forward-port removed: $port/$proto → $home_ip" \
+            || echo "firewalld: warning — could not remove forward-port $port/$proto"
+    fi
+}
+
+firewalld_save() {
+    firewalld_active || return 0
+    sudo firewall-cmd --runtime-to-permanent &>/dev/null \
+        && echo "firewalld: rules saved (runtime → permanent)" \
+        || echo "firewalld: warning — could not make rules permanent"
+}
+
+# Update install_iptables_persistence to warn when firewalld is active
+# (iptables rules still needed for DNAT; firewalld handles them differently)
+check_firewalld_conflict() {
+    if firewalld_active; then
+        echo "Warning: firewalld is active. iptables rules will be applied directly"
+        echo "         and firewalld rich rules will also be added for persistence."
+        echo "         If you experience conflicts, consider stopping firewalld:"
+        echo "           sudo systemctl stop firewalld && sudo systemctl disable firewalld"
+        echo
+    fi
+}
+
+# ─── IPv6 / ip6tables ─────────────────────────────────────────────────────────
+
+# ip6tables_rule <add|remove> <table> <chain> [rule args...]
+# DRY_RUN is respected if set
+ip6tables_rule() {
+    local action="$1" table="$2"; shift 2
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        local verb; [[ "$action" == "add" ]] && verb="-A" || verb="-D"
+        echo "[dry-run] ip6tables -t $table $verb $*"
+        return
+    fi
+    if ! command -v ip6tables &>/dev/null; then
+        echo "ip6tables: not found — skipping IPv6 rule" >&2; return
+    fi
+    if sudo ip6tables -t "$table" -C "$@" &>/dev/null; then
+        [[ "$action" == "add" ]] \
+            && echo "ip6tables: already exists (skip): -t $table $*" \
+            || { echo "ip6tables: removing: -t $table $*"; sudo ip6tables -t "$table" -D "$@"; }
+    else
+        [[ "$action" == "add" ]] \
+            && { echo "ip6tables: adding: -t $table $*"; sudo ip6tables -t "$table" -A "$@"; } \
+            || echo "ip6tables: not found (skip): -t $table $*"
+    fi
+}
+
+save_ip6tables() {
+    command -v ip6tables-save &>/dev/null || return
+    echo "Saving ip6tables rules..."
+    case "${OS_FAMILY:-debian}" in
+        debian|arch|suse|alpine|unknown)
+            sudo mkdir -p /etc/iptables
+            sudo ip6tables-save | sudo tee /etc/iptables/rules.v6 > /dev/null
+            echo "  → saved to /etc/iptables/rules.v6"
+            ;;
+        rhel|fedora)
+            sudo ip6tables-save | sudo tee /etc/sysconfig/ip6tables > /dev/null
+            echo "  → saved to /etc/sysconfig/ip6tables"
+            ;;
+    esac
+}
+
+install_ip6tables_persistence() {
+    command -v ip6tables &>/dev/null || return
+    case "${OS_FAMILY:-debian}" in
+        debian)
+            # iptables-persistent also handles ip6tables on Debian/Ubuntu
+            ;;
+        rhel|fedora)
+            # ip6tables-services is a separate package
+            pkg_install ip6tables-services &>/dev/null || true
+            ;;
+    esac
+}
+
+enable_ipv6_forwarding() {
+    sudo sysctl -w net.ipv6.conf.all.forwarding=1 &>/dev/null
+    echo "net.ipv6.conf.all.forwarding=1" | sudo tee -a /etc/sysctl.d/99-forward-traffic.conf > /dev/null
+    sudo sysctl --system &>/dev/null || sudo sysctl -p &>/dev/null || true
+    echo "IPv6 forwarding enabled."
+}

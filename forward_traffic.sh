@@ -26,24 +26,36 @@ fi
 # shellcheck source=lib.sh
 source "$LIB"
 
-# --- Configuration (overridden by config file if present) ---
+# ─── Defaults (overridden by config file) ─────────────────────────────────────
+
 PUBLIC_NETWORK_INTERFACE="ens6"
 VPS_VPN_IP="10.0.0.1"
 HOME_SERVER_IP="10.0.0.2"
+# IPv6 WireGuard VPN addresses (fd00::/64 is a private ULA prefix)
+VPS_VPN_IPv6="fd00::1"
+HOME_SERVER_IPv6="fd00::2"
+# Additional home servers: associative entries "label:ip"
+HOME_SERVERS=()
+
 CONFIG_FILE="/etc/forward-traffic.conf"
+ROUTES_FILE="/etc/forward-traffic.routes"
 DRY_RUN=false
+ENABLE_IPv6=false
 
 # ─── Dependency check ─────────────────────────────────────────────────────────
 
 check_dependencies() {
     echo "--- Checking dependencies ---"
     detect_os
+    check_firewalld_conflict
     if ! command -v iptables &>/dev/null; then
         echo "'iptables' not found — installing..."
         pkg_install iptables
     fi
     install_iptables_persistence
-    handle_ufw_for_wireguard
+    if $ENABLE_IPv6; then
+        install_ip6tables_persistence
+    fi
     echo "All dependencies satisfied."; echo
 }
 
@@ -54,18 +66,84 @@ load_config() {
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
     echo "Loaded config from $CONFIG_FILE"
-    printf "  Interface : %s\n  VPS VPN IP: %s\n  Home IP   : %s\n\n" \
+    printf "  Interface  : %s\n  VPS IP     : %s\n  Home IP    : %s\n" \
         "$PUBLIC_NETWORK_INTERFACE" "$VPS_VPN_IP" "$HOME_SERVER_IP"
+    if $ENABLE_IPv6; then
+        printf "  VPS IPv6   : %s\n  Home IPv6  : %s\n" "$VPS_VPN_IPv6" "$HOME_SERVER_IPv6"
+    fi
+    if [[ ${#HOME_SERVERS[@]} -gt 0 ]]; then
+        printf "  Extra hosts: %s\n" "${HOME_SERVERS[*]}"
+    fi
+    echo
 }
 
 save_config() {
     echo "Saving config to $CONFIG_FILE..."
+    local servers_serialized
+    servers_serialized=$(printf '"%s" ' "${HOME_SERVERS[@]+"${HOME_SERVERS[@]}"}")
     sudo tee "$CONFIG_FILE" > /dev/null <<EOF
 PUBLIC_NETWORK_INTERFACE="$PUBLIC_NETWORK_INTERFACE"
 VPS_VPN_IP="$VPS_VPN_IP"
 HOME_SERVER_IP="$HOME_SERVER_IP"
+VPS_VPN_IPv6="$VPS_VPN_IPv6"
+HOME_SERVER_IPv6="$HOME_SERVER_IPv6"
+ENABLE_IPv6=$ENABLE_IPv6
+HOME_SERVERS=($servers_serialized)
 EOF
     echo "Config saved."
+}
+
+# ─── Multi-home-server selection ──────────────────────────────────────────────
+
+# Sets FORWARD_TARGET and FORWARD_TARGET_IPv6 based on user selection or default
+select_forward_target() {
+    # Build full list: default home server + any extras from HOME_SERVERS
+    local -a labels=() ips=()
+    labels+=("Default (${HOME_SERVER_IP})")
+    ips+=("$HOME_SERVER_IP")
+
+    for entry in "${HOME_SERVERS[@]+"${HOME_SERVERS[@]}"}"; do
+        local label ip
+        label="${entry%%:*}"
+        ip="${entry##*:}"
+        labels+=("$label ($ip)")
+        ips+=("$ip")
+    done
+
+    if [[ ${#ips[@]} -eq 1 ]]; then
+        FORWARD_TARGET="${ips[0]}"
+        FORWARD_TARGET_IPv6="$HOME_SERVER_IPv6"
+        return
+    fi
+
+    echo "--- Select target home server ---"
+    for i in "${!labels[@]}"; do
+        printf "  %d) %s\n" "$((i+1))" "${labels[$i]}"
+    done
+    echo "  A) Add a new home server"
+    echo
+
+    while true; do
+        read -rp "Select [1-${#ips[@]} / A]: " sel
+        if [[ "${sel,,}" == "a" ]]; then
+            read -rp "  Label (e.g. Gaming PC): " new_label
+            read -rp "  IP address: " new_ip
+            validate_ip "$new_ip"
+            HOME_SERVERS+=("${new_label}:${new_ip}")
+            FORWARD_TARGET="$new_ip"
+            FORWARD_TARGET_IPv6="$HOME_SERVER_IPv6"
+            echo "  Added: $new_label → $new_ip"
+            break
+        elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#ips[@]} )); then
+            FORWARD_TARGET="${ips[$((sel-1))]}"
+            FORWARD_TARGET_IPv6="$HOME_SERVER_IPv6"
+            echo "  Target: ${labels[$((sel-1))]}"
+            break
+        else
+            echo "  Invalid selection."
+        fi
+    done
+    echo
 }
 
 # ─── Variable / interface check ───────────────────────────────────────────────
@@ -126,9 +204,11 @@ get_user_input() {
     fi
 
     printf "\nPorts : %s\nProto : %s\n\n" "${PORTS[*]}" "$PROTOCOL"
+
+    select_forward_target
 }
 
-# ─── iptables wrapper ─────────────────────────────────────────────────────────
+# ─── iptables + ip6tables wrappers ────────────────────────────────────────────
 
 # iptables_rule <add|remove> <table> <chain> [rule args...]
 iptables_rule() {
@@ -155,33 +235,56 @@ iptables_rule() {
 manage_rules() {
     local action="$1"; shift
     local protos=("$@")
+    local target="${FORWARD_TARGET:-$HOME_SERVER_IP}"
+    local target_v6="${FORWARD_TARGET_IPv6:-$HOME_SERVER_IPv6}"
 
     if [[ "$action" == "add" ]]; then
-        echo "--- Applying iptables rules ---"
+        echo "--- Applying rules → $target ---"
         enable_ip_forwarding
+        $ENABLE_IPv6 && enable_ipv6_forwarding || true
     else
-        echo "--- Removing iptables rules ---"
+        echo "--- Removing rules (target: $target) ---"
     fi
 
     for PORT in "${PORTS[@]}"; do
         for proto in "${protos[@]}"; do
             echo "  port $PORT / $proto..."
-            iptables_rule "$action" nat    PREROUTING  -p "$proto" --dport "$PORT" -j DNAT --to-destination "$HOME_SERVER_IP:$PORT"
-            iptables_rule "$action" nat    POSTROUTING -p "$proto" -d "$HOME_SERVER_IP" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
-            iptables_rule "$action" filter FORWARD     -p "$proto" -d "$HOME_SERVER_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+
+            # IPv4 iptables rules
+            iptables_rule "$action" nat    PREROUTING  -p "$proto" --dport "$PORT" -j DNAT --to-destination "$target:$PORT"
+            iptables_rule "$action" nat    POSTROUTING -p "$proto" -d "$target"   --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
+            iptables_rule "$action" filter FORWARD     -p "$proto" -d "$target"   --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+
+            # IPv6 ip6tables rules (only if enabled)
+            if $ENABLE_IPv6; then
+                ip6tables_rule "$action" nat    PREROUTING  -p "$proto" --dport "$PORT" -j DNAT --to-destination "[$target_v6]:$PORT"
+                ip6tables_rule "$action" nat    POSTROUTING -p "$proto" -d "$target_v6" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IPv6"
+                ip6tables_rule "$action" filter FORWARD     -p "$proto" -d "$target_v6" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
+            fi
+
+            # UFW (if active)
             ufw_manage_port "$action" "$PORT" "$proto"
+
+            # Firewalld (if active)
+            firewalld_manage_port "$action" "$PORT" "$proto" "$target" "$VPS_VPN_IP"
         done
     done
 
     if [[ "$action" == "add" ]]; then
         iptables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
+        if $ENABLE_IPv6; then
+            ip6tables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
+        fi
     fi
 
     if $DRY_RUN; then
         printf "\n--- [dry-run] %d port(s) would be %sed (no changes made). ---\n\n" "${#PORTS[@]}" "$action"
     else
         save_iptables
-        printf "\n--- Done: %d port(s) %sed. ---\n\n" "${#PORTS[@]}" "$action"
+        $ENABLE_IPv6 && save_ip6tables || true
+        firewalld_save
+        audit_log "$action" "$PROTOCOL" "${PORTS[*]}" "$target"
+        printf "\n--- Done: %d port(s) %sed → %s ---\n\n" "${#PORTS[@]}" "$action" "$target"
     fi
 }
 
@@ -191,21 +294,29 @@ list_rules() {
     echo
     echo "--- Active forwarding rules (PREROUTING DNAT) ---"
     echo
-    local rules
-    rules=$(sudo iptables -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)
-    if [[ -z "$rules" ]]; then
-        echo "  No forwarding rules found."
-    else
-        printf "  %-8s  %-8s  %s\n" "PROTO" "PORT" "DESTINATION"
-        printf "  %-8s  %-8s  %s\n" "--------" "--------" "-----------"
-        while IFS= read -r line; do
-            proto=$(awk '{print $1}' <<< "$line")
-            dport=$(grep -oP 'dpt:\K[0-9]+' <<< "$line" || echo "?")
-            dst=$(grep -oP 'to:\K\S+'       <<< "$line" || echo "?")
-            printf "  %-8s  %-8s  %s\n" "$proto" "$dport" "$dst"
-        done <<< "$rules"
+    _print_dnat_table "iptables" "$(sudo iptables  -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)"
+    if $ENABLE_IPv6 && command -v ip6tables &>/dev/null; then
+        echo
+        _print_dnat_table "ip6tables" "$(sudo ip6tables -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)"
     fi
     echo
+}
+
+_print_dnat_table() {
+    local label="$1" rules="$2"
+    echo "  [$label]"
+    if [[ -z "$rules" ]]; then
+        echo "  No rules found."
+        return
+    fi
+    printf "  %-8s  %-8s  %s\n" "PROTO" "PORT" "DESTINATION"
+    printf "  %-8s  %-8s  %s\n" "--------" "--------" "-----------"
+    while IFS= read -r line; do
+        proto=$(awk '{print $1}' <<< "$line")
+        dport=$(grep -oP 'dpt:\K[0-9]+' <<< "$line" || echo "?")
+        dst=$(grep -oP 'to:\K\S+' <<< "$line" || echo "?")
+        printf "  %-8s  %-8s  %s\n" "$proto" "$dport" "$dst"
+    done <<< "$rules"
 }
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
@@ -213,17 +324,24 @@ list_rules() {
 usage() {
     cat <<EOF
 
-Usage: $0 [--remove | --list | --help]
+Usage: $0 [options]
 
-  (no flag)   Forward port(s) from the VPS to the home server
-  --remove    Remove previously added forwarding rules
-  --dry-run   Show what rules would be applied without making any changes
-  --list      Show all currently active DNAT forwarding rules
-  --help      Show this help message
+  (no flag)       Forward port(s) from VPS to a home server
+  --remove        Remove previously added forwarding rules
+  --list          Show all currently active DNAT forwarding rules
+  --dry-run       Show what would be applied without making changes
+  --ipv6          Also apply ip6tables rules for IPv6 traffic
+  --audit [all]   Show audit log (last 50 entries, or all)
+  --help          Show this help message
 
 Port formats:  80  |  25565-25575  |  80,443,8080  |  80,443,8000-8010
 
-Config is auto-saved to $CONFIG_FILE after first run.
+Multi-home-server: if multiple home servers are configured in $CONFIG_FILE,
+you will be prompted to select a target when adding or removing rules.
+
+Config auto-saved to: $CONFIG_FILE
+Audit log at:         $AUDIT_LOG
+Routes file:          $ROUTES_FILE
 
 EOF
 }
@@ -233,13 +351,21 @@ EOF
 main() {
     local mode="add"
     case "${1:-}" in
-        --remove)   mode="remove"   ;;
-        --dry-run)  DRY_RUN=true   ;;
-        --list)   mode="list"   ;;
-        --help)   usage; exit 0 ;;
-        "")       ;;
+        --remove)   mode="remove"               ;;
+        --list)     mode="list"                 ;;
+        --dry-run)  DRY_RUN=true                ;;
+        --ipv6)     ENABLE_IPv6=true            ;;
+        --audit)    view_audit_log "${2:-50}"; exit 0 ;;
+        --help)     usage; exit 0               ;;
+        "")         ;;
         *) echo "Error: Unknown option '$1'. Use --help." >&2; exit 1 ;;
     esac
+
+    # Allow combining flags: --dry-run and --ipv6 can follow any positional
+    for arg in "$@"; do
+        [[ "$arg" == "--dry-run" ]] && DRY_RUN=true
+        [[ "$arg" == "--ipv6"   ]] && ENABLE_IPv6=true
+    done
 
     require_sudo_or_root
     check_dependencies
