@@ -26,62 +26,86 @@ fi
 # shellcheck source=lib.sh
 source "$LIB"
 
-# ─── Defaults (overridden by config file) ─────────────────────────────────────
-
-PUBLIC_NETWORK_INTERFACE=""  # auto-detected at runtime
-VPS_VPN_IP="10.0.0.1"
-HOME_SERVER_IP="10.0.0.2"
-# IPv6 WireGuard VPN addresses (fd00::/64 is a private ULA prefix)
-VPS_VPN_IPv6="fd00::1"
-HOME_SERVER_IPv6="fd00::2"
-# Additional home servers: associative entries "label:ip"
-HOME_SERVERS=()
+# ─── Defaults ─────────────────────────────────────────────────────────────────
 
 CONFIG_FILE="/etc/forward-traffic.conf"
 ROUTES_FILE="/etc/forward-traffic.routes"
 DRY_RUN=false
 ENABLE_IPv6=false
 
-# ─── Dependency check ─────────────────────────────────────────────────────────
+PUBLIC_NETWORK_INTERFACE=""
+VPS_VPN_IP=""
+HOME_SERVER_IP=""
+VPS_VPN_IPv6="fd00::1"
+HOME_SERVER_IPv6="fd00::2"
+HOME_SERVERS=()
+
+# ─── Dependencies ─────────────────────────────────────────────────────────────
 
 check_dependencies() {
     echo "--- Checking dependencies ---"
     detect_os
     check_firewalld_conflict
-    if ! command -v iptables &>/dev/null; then
-        echo "'iptables' not found — installing..."
-        pkg_install iptables
-    fi
+    command -v iptables &>/dev/null || pkg_install iptables
     install_iptables_persistence
-    if $ENABLE_IPv6; then
-        install_ip6tables_persistence
-    fi
+    $ENABLE_IPv6 && install_ip6tables_persistence || true
     echo "All dependencies satisfied."; echo
+}
+
+# ─── First-run wizard ─────────────────────────────────────────────────────────
+
+run_wizard() {
+    echo
+    echo "  ┌─ Forward Traffic — First Run Wizard ───────────────────────────"
+    echo "  │  Configure the VPN IPs and network interface used for forwarding."
+    echo "  │  Answers are saved to $CONFIG_FILE for future runs."
+    echo "  └────────────────────────────────────────────────────────────────"
+    echo
+
+    # Public interface
+    detect_public_interface
+    if [[ -n "$PUBLIC_NETWORK_INTERFACE" ]]; then
+        prompt_with_default PUBLIC_NETWORK_INTERFACE \
+            "  Public network interface (auto-detected)" \
+            "$PUBLIC_NETWORK_INTERFACE"
+    else
+        prompt_required PUBLIC_NETWORK_INTERFACE \
+            "  Public network interface (e.g. eth0, ens3)"
+    fi
+    while ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null; do
+        echo "  Interface '$PUBLIC_NETWORK_INTERFACE' not found. Try again."
+        prompt_required PUBLIC_NETWORK_INTERFACE "  Public network interface"
+    done
+
+    # Try to read VPN IPs from existing wg0.conf first
+    detect_wg_config_values
+
+    prompt_with_default VPS_VPN_IP  "  VPS WireGuard VPN IP"         "${VPS_VPN_IP:-10.0.0.1}"
+    prompt_with_default HOME_SERVER_IP "  Home server WireGuard VPN IP" "${HOME_SERVER_IP:-10.0.0.2}"
+    validate_ip "$VPS_VPN_IP"
+    validate_ip "$HOME_SERVER_IP"
+
+    # IPv6
+    read -rp "  Enable IPv6 forwarding? [y/N]: " _v6
+    if [[ "${_v6,,}" == "y" ]]; then
+        ENABLE_IPv6=true
+        prompt_with_default VPS_VPN_IPv6    "  VPS WireGuard IPv6"         "$VPS_VPN_IPv6"
+        prompt_with_default HOME_SERVER_IPv6 "  Home server WireGuard IPv6" "$HOME_SERVER_IPv6"
+    fi
+
+    echo
+    _save_config
 }
 
 # ─── Config persistence ───────────────────────────────────────────────────────
 
-load_config() {
-    [[ -f "$CONFIG_FILE" ]] || return
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-    echo "Loaded config from $CONFIG_FILE"
-    printf "  Interface  : %s\n  VPS IP     : %s\n  Home IP    : %s\n" \
-        "$PUBLIC_NETWORK_INTERFACE" "$VPS_VPN_IP" "$HOME_SERVER_IP"
-    if $ENABLE_IPv6; then
-        printf "  VPS IPv6   : %s\n  Home IPv6  : %s\n" "$VPS_VPN_IPv6" "$HOME_SERVER_IPv6"
-    fi
-    if [[ ${#HOME_SERVERS[@]} -gt 0 ]]; then
-        printf "  Extra hosts: %s\n" "${HOME_SERVERS[*]}"
-    fi
-    echo
-}
-
-save_config() {
-    echo "Saving config to $CONFIG_FILE..."
+_save_config() {
     local servers_serialized
     servers_serialized=$(printf '"%s" ' "${HOME_SERVERS[@]+"${HOME_SERVERS[@]}"}")
-    sudo tee "$CONFIG_FILE" > /dev/null <<EOF
+    local tmpfile
+    tmpfile=$(mktemp)
+    cat > "$tmpfile" <<EOF
+# forward-traffic config — auto-generated $(date '+%Y-%m-%d %H:%M:%S')
 PUBLIC_NETWORK_INTERFACE="$PUBLIC_NETWORK_INTERFACE"
 VPS_VPN_IP="$VPS_VPN_IP"
 HOME_SERVER_IP="$HOME_SERVER_IP"
@@ -90,24 +114,56 @@ HOME_SERVER_IPv6="$HOME_SERVER_IPv6"
 ENABLE_IPv6=$ENABLE_IPv6
 HOME_SERVERS=($servers_serialized)
 EOF
-    echo "Config saved."
+    sudo cp "$tmpfile" "$CONFIG_FILE"
+    rm -f "$tmpfile"
+    sudo chmod 644 "$CONFIG_FILE"
+    echo "Config saved to $CONFIG_FILE"
+}
+
+_load_config() {
+    load_script_config "$CONFIG_FILE" || return 1
+    echo "Loaded config from $CONFIG_FILE"
+    printf "  %-26s %s\n" "Interface:"          "$PUBLIC_NETWORK_INTERFACE"
+    printf "  %-26s %s\n" "VPS VPN IP:"         "$VPS_VPN_IP"
+    printf "  %-26s %s\n" "Home server VPN IP:" "$HOME_SERVER_IP"
+    $ENABLE_IPv6 && {
+        printf "  %-26s %s\n" "VPS IPv6:"         "$VPS_VPN_IPv6"
+        printf "  %-26s %s\n" "Home server IPv6:" "$HOME_SERVER_IPv6"
+    } || true
+    [[ ${#HOME_SERVERS[@]} -gt 0 ]] && \
+        printf "  %-26s %s\n" "Extra home servers:" "${HOME_SERVERS[*]}" || true
+    echo
+    return 0
+}
+
+# ─── Variable validation ──────────────────────────────────────────────────────
+
+check_variables() {
+    [[ -n "$VPS_VPN_IP" && -n "$HOME_SERVER_IP" ]] || {
+        echo "Error: VPS_VPN_IP and HOME_SERVER_IP must be set." >&2; exit 1
+    }
+    validate_ip "$VPS_VPN_IP"
+    validate_ip "$HOME_SERVER_IP"
+    [[ -z "$PUBLIC_NETWORK_INTERFACE" ]] && detect_public_interface
+    if [[ -z "$PUBLIC_NETWORK_INTERFACE" ]] || ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null 2>&1; then
+        echo "Warning: Interface '${PUBLIC_NETWORK_INTERFACE:-<none>}' not found."
+        prompt_required PUBLIC_NETWORK_INTERFACE "  Enter interface name manually (e.g. eth0, ens3)"
+        ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null || {
+            echo "Error: Interface '$PUBLIC_NETWORK_INTERFACE' still not found." >&2; exit 1
+        }
+    fi
+    echo "Using interface: $PUBLIC_NETWORK_INTERFACE"
 }
 
 # ─── Multi-home-server selection ──────────────────────────────────────────────
 
-# Sets FORWARD_TARGET and FORWARD_TARGET_IPv6 based on user selection or default
 select_forward_target() {
-    # Build full list: default home server + any extras from HOME_SERVERS
     local -a labels=() ips=()
     labels+=("Default (${HOME_SERVER_IP})")
     ips+=("$HOME_SERVER_IP")
-
     for entry in "${HOME_SERVERS[@]+"${HOME_SERVERS[@]}"}"; do
-        local label ip
-        label="${entry%%:*}"
-        ip="${entry##*:}"
-        labels+=("$label ($ip)")
-        ips+=("$ip")
+        labels+=("${entry%%:*} (${entry##*:})")
+        ips+=("${entry##*:}")
     done
 
     if [[ ${#ips[@]} -eq 1 ]]; then
@@ -146,33 +202,7 @@ select_forward_target() {
     echo
 }
 
-# ─── Variable / interface check ───────────────────────────────────────────────
-
-check_variables() {
-    [[ -n "$VPS_VPN_IP" && -n "$HOME_SERVER_IP" ]] || {
-        echo "Error: VPS_VPN_IP and HOME_SERVER_IP must be set." >&2; exit 1
-    }
-    validate_ip "$VPS_VPN_IP"
-    validate_ip "$HOME_SERVER_IP"
-
-    # Auto-detect interface if not already set (e.g. from config file)
-    if [[ -z "$PUBLIC_NETWORK_INTERFACE" ]]; then
-        detect_public_interface
-    fi
-
-    # Confirm with user if detection failed or interface is not found
-    if [[ -z "$PUBLIC_NETWORK_INTERFACE" ]] || ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null 2>&1; then
-        echo "Warning: Interface '${PUBLIC_NETWORK_INTERFACE:-<none>}' not found or unreachable."
-        read -rp "Enter interface name manually (e.g. eth0, ens3): " PUBLIC_NETWORK_INTERFACE
-        ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null || {
-            echo "Error: Interface '$PUBLIC_NETWORK_INTERFACE' still not found." >&2; exit 1
-        }
-    fi
-
-    echo "Using interface: $PUBLIC_NETWORK_INTERFACE"
-}
-
-# ─── Port parsing ─────────────────────────────────────────────────────────────
+# ─── Port input ───────────────────────────────────────────────────────────────
 
 parse_ports() {
     local input="${1//;/,}" ports=()
@@ -215,19 +245,16 @@ get_user_input() {
     fi
 
     printf "\nPorts : %s\nProto : %s\n\n" "${PORTS[*]}" "$PROTOCOL"
-
     select_forward_target
 }
 
-# ─── iptables + ip6tables wrappers ────────────────────────────────────────────
+# ─── iptables wrappers ────────────────────────────────────────────────────────
 
-# iptables_rule <add|remove> <table> <chain> [rule args...]
 iptables_rule() {
     local action="$1" table="$2"; shift 2
     if $DRY_RUN; then
         local verb; [[ "$action" == "add" ]] && verb="-A" || verb="-D"
-        echo "[dry-run] iptables -t $table $verb $*"
-        return
+        echo "[dry-run] iptables -t $table $verb $*"; return
     fi
     if sudo iptables -t "$table" -C "$@" &>/dev/null; then
         [[ "$action" == "add" ]] \
@@ -242,50 +269,37 @@ iptables_rule() {
 
 # ─── Rule management ──────────────────────────────────────────────────────────
 
-# manage_rules <add|remove> <proto> [proto ...]
 manage_rules() {
     local action="$1"; shift
     local protos=("$@")
     local target="${FORWARD_TARGET:-$HOME_SERVER_IP}"
     local target_v6="${FORWARD_TARGET_IPv6:-$HOME_SERVER_IPv6}"
 
-    if [[ "$action" == "add" ]]; then
+    [[ "$action" == "add" ]] && {
         echo "--- Applying rules → $target ---"
         enable_ip_forwarding
         $ENABLE_IPv6 && enable_ipv6_forwarding || true
-    else
-        echo "--- Removing rules (target: $target) ---"
-    fi
+    } || echo "--- Removing rules (target: $target) ---"
 
     for PORT in "${PORTS[@]}"; do
         for proto in "${protos[@]}"; do
             echo "  port $PORT / $proto..."
-
-            # IPv4 iptables rules
             iptables_rule "$action" nat    PREROUTING  -p "$proto" --dport "$PORT" -j DNAT --to-destination "$target:$PORT"
             iptables_rule "$action" nat    POSTROUTING -p "$proto" -d "$target"   --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IP"
             iptables_rule "$action" filter FORWARD     -p "$proto" -d "$target"   --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
-
-            # IPv6 ip6tables rules (only if enabled)
             if $ENABLE_IPv6; then
                 ip6tables_rule "$action" nat    PREROUTING  -p "$proto" --dport "$PORT" -j DNAT --to-destination "[$target_v6]:$PORT"
                 ip6tables_rule "$action" nat    POSTROUTING -p "$proto" -d "$target_v6" --dport "$PORT" -j SNAT --to-source "$VPS_VPN_IPv6"
                 ip6tables_rule "$action" filter FORWARD     -p "$proto" -d "$target_v6" --dport "$PORT" -m state --state NEW,ESTABLISHED -j ACCEPT
             fi
-
-            # UFW (if active)
             ufw_manage_port "$action" "$PORT" "$proto"
-
-            # Firewalld (if active)
             firewalld_manage_port "$action" "$PORT" "$proto" "$target" "$VPS_VPN_IP"
         done
     done
 
     if [[ "$action" == "add" ]]; then
         iptables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
-        if $ENABLE_IPv6; then
-            ip6tables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE
-        fi
+        $ENABLE_IPv6 && ip6tables_rule add nat POSTROUTING -o "$PUBLIC_NETWORK_INTERFACE" -j MASQUERADE || true
     fi
 
     if $DRY_RUN; then
@@ -299,13 +313,11 @@ manage_rules() {
     fi
 }
 
-# ─── List active rules ────────────────────────────────────────────────────────
+# ─── List rules ───────────────────────────────────────────────────────────────
 
 list_rules() {
-    echo
-    echo "--- Active forwarding rules (PREROUTING DNAT) ---"
-    echo
-    _print_dnat_table "iptables" "$(sudo iptables  -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)"
+    echo; echo "--- Active forwarding rules (PREROUTING DNAT) ---"; echo
+    _print_dnat_table "iptables"  "$(sudo iptables  -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)"
     if $ENABLE_IPv6 && command -v ip6tables &>/dev/null; then
         echo
         _print_dnat_table "ip6tables" "$(sudo ip6tables -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)"
@@ -316,16 +328,13 @@ list_rules() {
 _print_dnat_table() {
     local label="$1" rules="$2"
     echo "  [$label]"
-    if [[ -z "$rules" ]]; then
-        echo "  No rules found."
-        return
-    fi
+    [[ -z "$rules" ]] && { echo "  No rules found."; return; }
     printf "  %-8s  %-8s  %s\n" "PROTO" "PORT" "DESTINATION"
     printf "  %-8s  %-8s  %s\n" "--------" "--------" "-----------"
     while IFS= read -r line; do
         proto=$(awk '{print $1}' <<< "$line")
         dport=$(grep -oP 'dpt:\K[0-9]+' <<< "$line" || echo "?")
-        dst=$(grep -oP 'to:\K\S+' <<< "$line" || echo "?")
+        dst=$(grep -oP 'to:\K\S+'       <<< "$line" || echo "?")
         printf "  %-8s  %-8s  %s\n" "$proto" "$dport" "$dst"
     done <<< "$rules"
 }
@@ -342,17 +351,14 @@ Usage: $0 [options]
   --list          Show all currently active DNAT forwarding rules
   --dry-run       Show what would be applied without making changes
   --ipv6          Also apply ip6tables rules for IPv6 traffic
+  --reconfigure   Re-run the setup wizard even if a config exists
   --audit [all]   Show audit log (last 50 entries, or all)
   --help          Show this help message
 
 Port formats:  80  |  25565-25575  |  80,443,8080  |  80,443,8000-8010
 
-Multi-home-server: if multiple home servers are configured in $CONFIG_FILE,
-you will be prompted to select a target when adding or removing rules.
-
-Config auto-saved to: $CONFIG_FILE
-Audit log at:         $AUDIT_LOG
-Routes file:          $ROUTES_FILE
+Config file:  $CONFIG_FILE   (edit this to change settings)
+Audit log:    $AUDIT_LOG
 
 EOF
 }
@@ -360,31 +366,41 @@ EOF
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    local mode="add"
-    case "${1:-}" in
-        --remove)   mode="remove"               ;;
-        --list)     mode="list"                 ;;
-        --dry-run)  DRY_RUN=true                ;;
-        --ipv6)     ENABLE_IPv6=true            ;;
-        --audit)    view_audit_log "${2:-50}"; exit 0 ;;
-        --help)     usage; exit 0               ;;
-        "")         ;;
-        *) echo "Error: Unknown option '$1'. Use --help." >&2; exit 1 ;;
-    esac
+    local mode="add" reconfigure=false
 
-    # Allow combining flags: --dry-run and --ipv6 can follow any positional
     for arg in "$@"; do
-        [[ "$arg" == "--dry-run" ]] && DRY_RUN=true
-        [[ "$arg" == "--ipv6"   ]] && ENABLE_IPv6=true
+        case "$arg" in
+            --remove)       mode="remove"     ;;
+            --list)         mode="list"       ;;
+            --dry-run)      DRY_RUN=true      ;;
+            --ipv6)         ENABLE_IPv6=true  ;;
+            --reconfigure)  reconfigure=true  ;;
+            --audit)        ;;  # handled below
+            --help)         usage; exit 0     ;;
+            all)            ;;  # audit subarg
+            *) echo "Error: Unknown option '$arg'. Use --help." >&2; exit 1 ;;
+        esac
     done
+
+    # --audit is special: show log and exit immediately (no sudo needed for reading)
+    [[ "${1:-}" == "--audit" ]] && { view_audit_log "${2:-50}"; exit 0; }
 
     require_sudo_or_root
     check_dependencies
 
-    if [[ "$mode" == "list" ]]; then list_rules; exit 0; fi
+    [[ "$mode" == "list" ]] && { list_rules; exit 0; }
 
-    load_config
-    detect_wg_config_values   # fill in VPS/home IPs from wg0.conf if not in config
+    # Config: first run → wizard. Subsequent runs → load + confirm (or --reconfigure)
+    if $reconfigure || ! _load_config; then
+        [[ -f "$CONFIG_FILE" ]] && echo "Re-running setup wizard..." || echo "No config found — running first-time setup wizard."
+        run_wizard
+    else
+        if ! confirm_or_rewizard "Loaded config ($CONFIG_FILE)" \
+            PUBLIC_NETWORK_INTERFACE VPS_VPN_IP HOME_SERVER_IP ENABLE_IPv6; then
+            run_wizard
+        fi
+    fi
+
     check_variables
     get_user_input
 
@@ -392,7 +408,7 @@ main() {
     [[ "$PROTOCOL" == "all" ]] && protos=(tcp udp)
 
     manage_rules "$mode" "${protos[@]}"
-    [[ "$mode" == "add" ]] && ! $DRY_RUN && save_config || true
+    [[ "$mode" == "add" ]] && ! $DRY_RUN && _save_config || true
 }
 
 main "$@"

@@ -215,6 +215,78 @@ validate_ip() {
     done
 }
 
+# ─── Config file helpers ──────────────────────────────────────────────────────
+
+# prompt_with_default <varname> <prompt> <default>
+# Shows "[default]" in the prompt. Pressing Enter keeps the default.
+prompt_with_default() {
+    local varname="$1" prompt="$2" default="$3"
+    local input
+    read -rp "$prompt [${default}]: " input
+    printf -v "$varname" '%s' "${input:-$default}"
+}
+
+# prompt_required <varname> <prompt>
+# Keeps asking until the user enters something non-empty.
+prompt_required() {
+    local varname="$1" prompt="$2"
+    local input=""
+    while [[ -z "$input" ]]; do
+        read -rp "$prompt: " input
+        [[ -z "$input" ]] && echo "  This value is required."
+    done
+    printf -v "$varname" '%s' "$input"
+}
+
+# load_script_config <config_path>
+# Sources the file if it exists. Returns 0 if loaded, 1 if not.
+load_script_config() {
+    local cfg="$1"
+    [[ -f "$cfg" ]] || return 1
+    # shellcheck source=/dev/null
+    source "$cfg"
+    return 0
+}
+
+# save_script_config <config_path> <var1> [var2 ...]
+# Writes each named variable as KEY="value" to the config file.
+save_script_config() {
+    local cfg="$1"; shift
+    local tmpfile
+    tmpfile=$(mktemp)
+    printf "# forward-traffic config — auto-generated %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" > "$tmpfile"
+    for var in "$@"; do
+        printf '%s="%s"\n' "$var" "${!var}" >> "$tmpfile"
+    done
+    sudo cp "$tmpfile" "$cfg"
+    rm -f "$tmpfile"
+    sudo chmod 644 "$cfg"
+    echo "Config saved to $cfg"
+}
+
+# show_config_summary <label> <var1> [var2 ...]
+# Prints a formatted summary of the given variables.
+show_config_summary() {
+    local label="$1"; shift
+    echo
+    echo "  ┌─ $label ─────────────────────────────────"
+    for var in "$@"; do
+        printf "  │  %-30s %s\n" "${var}:" "${!var:-<not set>}"
+    done
+    echo "  └──────────────────────────────────────────"
+    echo
+}
+
+# confirm_or_rewizard <label> <var1> [var2 ...]
+# Shows loaded config values and asks user to confirm or re-run wizard.
+# Returns 0 to use config, 1 to re-run wizard.
+confirm_or_rewizard() {
+    local label="$1"; shift
+    show_config_summary "$label" "$@"
+    read -rp "  Use this config? [Y/n]: " _ok
+    [[ "${_ok,,}" != "n" ]]
+}
+
 # ─── VPS public IP detection ──────────────────────────────────────────────────
 
 # Detects this machine's public IPv4 address using multiple external services.

@@ -26,10 +26,67 @@ fi
 # shellcheck source=lib.sh
 source "$LIB"
 
+CONFIG_FILE="/etc/forward-traffic-vps.conf"
+
+# Config variables with defaults
+PUBLIC_NETWORK_INTERFACE=""
+VPS_PUBLIC_IP=""
+WG_PORT=51820
+WG_VPN_IP_VPS="10.0.0.1"
+WG_VPN_IP_HOME="10.0.0.2"
 ENABLE_IPv6=false
 VPS_VPN_IPv6="fd00::1"
 HOME_SERVER_IPv6="fd00::2"
-WG_PORT=51820
+
+# ─── First-run wizard ─────────────────────────────────────────────────────────
+
+run_wizard() {
+    echo
+    echo "  ┌─ VPS Setup Wizard ─────────────────────────────────────────────"
+    echo "  │  This will configure WireGuard on your VPS."
+    echo "  │  Answers are saved to $CONFIG_FILE for future runs."
+    echo "  └────────────────────────────────────────────────────────────────"
+    echo
+
+    # Interface
+    detect_public_interface
+    if [[ -n "$PUBLIC_NETWORK_INTERFACE" ]]; then
+        prompt_with_default PUBLIC_NETWORK_INTERFACE \
+            "  Public network interface (auto-detected)" \
+            "$PUBLIC_NETWORK_INTERFACE"
+    else
+        prompt_required PUBLIC_NETWORK_INTERFACE \
+            "  Public network interface (e.g. eth0, ens3)"
+    fi
+    while ! ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null; do
+        echo "  Interface '$PUBLIC_NETWORK_INTERFACE' not found. Try again."
+        prompt_required PUBLIC_NETWORK_INTERFACE \
+            "  Public network interface (e.g. eth0, ens3)"
+    done
+
+    # WireGuard port
+    detect_wireguard_port
+    prompt_with_default WG_PORT "  WireGuard listen port" "$WG_PORT"
+
+    # VPN subnet
+    detect_vpn_subnet
+    prompt_with_default WG_VPN_IP_VPS "  VPS VPN IP" "$WG_VPN_IP_VPS"
+    prompt_with_default WG_VPN_IP_HOME "  Home server VPN IP" "$WG_VPN_IP_HOME"
+
+    # IPv6
+    read -rp "  Enable IPv6 dual-stack? [y/N]: " _v6
+    if [[ "${_v6,,}" == "y" ]]; then
+        ENABLE_IPv6=true
+        prompt_with_default VPS_VPN_IPv6   "  VPS WireGuard IPv6 address"         "$VPS_VPN_IPv6"
+        prompt_with_default HOME_SERVER_IPv6 "  Home server WireGuard IPv6 address" "$HOME_SERVER_IPv6"
+    fi
+
+    echo
+    save_script_config "$CONFIG_FILE" \
+        PUBLIC_NETWORK_INTERFACE WG_PORT \
+        WG_VPN_IP_VPS WG_VPN_IP_HOME \
+        ENABLE_IPv6 VPS_VPN_IPv6 HOME_SERVER_IPv6
+}
 
 # ─── WireGuard config ─────────────────────────────────────────────────────────
 
@@ -41,15 +98,14 @@ wireguard_setup() {
     local privkey
     privkey=$(sudo cat /etc/wireguard/privatekey)
 
-    # Build Address and AllowedIPs with optional IPv6
     local addr="${WG_VPN_IP_VPS}/24"
     local peer_allowed="${WG_VPN_IP_HOME}/32"
     local postup_v6="" postdown_v6=""
     if $ENABLE_IPv6; then
         addr="${WG_VPN_IP_VPS}/24, ${VPS_VPN_IPv6}/64"
         peer_allowed="${WG_VPN_IP_HOME}/32, ${HOME_SERVER_IPv6}/128"
-        postup_v6="; sysctl -w net.ipv6.conf.all.forwarding=1; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${PUBLIC_IFACE} -j MASQUERADE"
-        postdown_v6="; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${PUBLIC_IFACE} -j MASQUERADE"
+        postup_v6="; sysctl -w net.ipv6.conf.all.forwarding=1; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${PUBLIC_NETWORK_INTERFACE} -j MASQUERADE"
+        postdown_v6="; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${PUBLIC_NETWORK_INTERFACE} -j MASQUERADE"
     fi
 
     echo "--- Creating /etc/wireguard/wg0.conf ---"
@@ -58,8 +114,8 @@ wireguard_setup() {
 Address    = ${addr}
 PrivateKey = ${privkey}
 ListenPort = ${WG_PORT}
-PostUp     = sysctl -w net.ipv4.ip_forward=1; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${PUBLIC_IFACE} -j MASQUERADE${postup_v6}
-PostDown   = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${PUBLIC_IFACE} -j MASQUERADE${postdown_v6}
+PostUp     = sysctl -w net.ipv4.ip_forward=1; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${PUBLIC_NETWORK_INTERFACE} -j MASQUERADE${postup_v6}
+PostDown   = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${PUBLIC_NETWORK_INTERFACE} -j MASQUERADE${postdown_v6}
 
 [Peer]
 # Replace with the output of: cat /etc/wireguard/publickey  (on the home server)
@@ -74,50 +130,32 @@ main() {
     require_sudo_or_root
     detect_os
 
-    echo "VPS setup for WireGuard port forwarding."
     echo
+    echo "=== VPS Setup for WireGuard Port Forwarding ==="
 
-    # ── Auto-detect everything possible ──────────────────────────────────────
-    detect_public_interface
-    detect_vps_public_ip
-    detect_wireguard_port
-    detect_vpn_subnet
-    backup_existing_wg_config
-
-    # ── Interface confirmation ────────────────────────────────────────────────
-    if [[ -n "$PUBLIC_NETWORK_INTERFACE" ]]; then
-        read -rp "Public interface detected as '$PUBLIC_NETWORK_INTERFACE'. Use it? [Y/n]: " _conf
-        if [[ "${_conf,,}" == "n" ]]; then
-            while true; do
-                read -rp "Enter interface name manually (e.g. eth0, ens3): " PUBLIC_NETWORK_INTERFACE
-                ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null && break || echo "Interface not found. Try again."
-            done
+    # First run: wizard. Subsequent runs: load + confirm.
+    if load_script_config "$CONFIG_FILE"; then
+        if ! confirm_or_rewizard "Loaded config ($CONFIG_FILE)" \
+            PUBLIC_NETWORK_INTERFACE WG_PORT \
+            WG_VPN_IP_VPS WG_VPN_IP_HOME \
+            ENABLE_IPv6 VPS_VPN_IPv6 HOME_SERVER_IPv6; then
+            run_wizard
         fi
     else
-        while true; do
-            read -rp "Could not auto-detect. Enter interface name (e.g. eth0, ens3): " PUBLIC_NETWORK_INTERFACE
-            ip link show "$PUBLIC_NETWORK_INTERFACE" &>/dev/null && break || echo "Interface not found. Try again."
-        done
-    fi
-    PUBLIC_IFACE="$PUBLIC_NETWORK_INTERFACE"
-
-    # ── IPv6 ─────────────────────────────────────────────────────────────────
-    read -rp "Enable IPv6 dual-stack WireGuard? [y/N]: " ans_v6
-    [[ "${ans_v6,,}" == "y" ]] && ENABLE_IPv6=true || true
-
-    if $ENABLE_IPv6; then
-        read -rp "VPS WireGuard IPv6 address [fd00::1]: " v6_in
-        [[ -n "$v6_in" ]] && VPS_VPN_IPv6="$v6_in" || true
-        read -rp "Home server WireGuard IPv6 address [fd00::2]: " v6_home
-        [[ -n "$v6_home" ]] && HOME_SERVER_IPv6="$v6_home" || true
+        echo "No config found — running first-time setup wizard."
+        run_wizard
     fi
 
+    backup_existing_wg_config
     install_wireguard
     wireguard_setup
     enable_ip_forwarding
     $ENABLE_IPv6 && enable_ipv6_forwarding || true
     handle_ufw_for_wireguard
     systemd_enable wg-quick@wg0
+
+    # Detect and display public IP for the user
+    detect_vps_public_ip
 
     echo
     echo "✓ VPS setup complete."
@@ -128,9 +166,11 @@ main() {
     echo "  Your VPS public key (share with home server):"
     sudo cat /etc/wireguard/publickey
     echo
-    if [[ -n "${VPS_PUBLIC_IP:-}" ]]; then
+    [[ -n "${VPS_PUBLIC_IP:-}" ]] && \
         echo "  Your VPS public IP (enter this in setup_home.sh): $VPS_PUBLIC_IP"
-    fi
+    echo
+    echo "  To change settings later, edit: $CONFIG_FILE"
+    echo "  Then re-run this script."
 
     auto_key_exchange \
         "<Public_Key_of_VPS>" \

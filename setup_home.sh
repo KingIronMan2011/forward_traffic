@@ -26,9 +26,57 @@ fi
 # shellcheck source=lib.sh
 source "$LIB"
 
+CONFIG_FILE="/etc/forward-traffic-home.conf"
+
+# Config variables with defaults
+VPS_PUBLIC_IP=""
+WG_PORT=51820
+WG_VPN_IP_VPS="10.0.0.1"
+WG_VPN_IP_HOME="10.0.0.2"
 ENABLE_IPv6=false
 VPS_VPN_IPv6="fd00::1"
 HOME_SERVER_IPv6="fd00::2"
+
+# ─── First-run wizard ─────────────────────────────────────────────────────────
+
+run_wizard() {
+    echo
+    echo "  ┌─ Home Server Setup Wizard ─────────────────────────────────────"
+    echo "  │  This will configure WireGuard on your home server."
+    echo "  │  Answers are saved to $CONFIG_FILE for future runs."
+    echo "  └────────────────────────────────────────────────────────────────"
+    echo
+
+    # VPS public IP — required, no auto-detect possible from home side
+    echo "  Enter the public IP of your VPS."
+    echo "  (It was printed at the end of setup_vps.sh)"
+    while true; do
+        prompt_required VPS_PUBLIC_IP "  VPS public IP"
+        validate_ip "$VPS_PUBLIC_IP" && break || echo "  Invalid IP format. Try again."
+    done
+
+    # WireGuard port
+    prompt_with_default WG_PORT "  WireGuard port on VPS" "$WG_PORT"
+
+    # VPN subnet — auto-detect conflicts, then let user confirm
+    detect_vpn_subnet
+    prompt_with_default WG_VPN_IP_VPS  "  VPS VPN IP (must match setup_vps.sh)"  "$WG_VPN_IP_VPS"
+    prompt_with_default WG_VPN_IP_HOME "  Home server VPN IP (must match setup_vps.sh)" "$WG_VPN_IP_HOME"
+
+    # IPv6
+    read -rp "  Enable IPv6 dual-stack? [y/N]: " _v6
+    if [[ "${_v6,,}" == "y" ]]; then
+        ENABLE_IPv6=true
+        prompt_with_default VPS_VPN_IPv6    "  VPS WireGuard IPv6 (must match setup_vps.sh)" "$VPS_VPN_IPv6"
+        prompt_with_default HOME_SERVER_IPv6 "  Home server WireGuard IPv6"                   "$HOME_SERVER_IPv6"
+    fi
+
+    echo
+    save_script_config "$CONFIG_FILE" \
+        VPS_PUBLIC_IP WG_PORT \
+        WG_VPN_IP_VPS WG_VPN_IP_HOME \
+        ENABLE_IPv6 VPS_VPN_IPv6 HOME_SERVER_IPv6
+}
 
 # ─── WireGuard config ─────────────────────────────────────────────────────────
 
@@ -40,7 +88,6 @@ wireguard_setup() {
     local privkey
     privkey=$(sudo cat /etc/wireguard/privatekey)
 
-    # Build Address and AllowedIPs with optional IPv6
     local addr="${WG_VPN_IP_HOME}/24"
     local peer_allowed="${WG_VPN_IP_VPS}/32"
     if $ENABLE_IPv6; then
@@ -69,35 +116,23 @@ main() {
     require_sudo_or_root
     detect_os
 
-    echo "Home server setup for WireGuard port forwarding."
     echo
+    echo "=== Home Server Setup for WireGuard Port Forwarding ==="
 
-    # ── Auto-detect what we can ───────────────────────────────────────────────
-    detect_vpn_subnet
-    backup_existing_wg_config
-
-    # ── VPS public IP ─────────────────────────────────────────────────────────
-    read -rp "Public IP address of the VPS (from setup_vps.sh output): " VPS_PUBLIC_IP
-    while [[ ! "$VPS_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
-        echo "Invalid IP format. Try again."
-        read -rp "Public IP address of the VPS: " VPS_PUBLIC_IP
-    done
-
-    # ── WireGuard port ────────────────────────────────────────────────────────
-    read -rp "WireGuard listen port on VPS [51820]: " WG_PORT_INPUT
-    WG_PORT="${WG_PORT_INPUT:-51820}"
-
-    # ── IPv6 ─────────────────────────────────────────────────────────────────
-    read -rp "Enable IPv6 dual-stack WireGuard? [y/N]: " ans_v6
-    [[ "${ans_v6,,}" == "y" ]] && ENABLE_IPv6=true || true
-
-    if $ENABLE_IPv6; then
-        read -rp "VPS WireGuard IPv6 address [fd00::1]: " v6_vps
-        [[ -n "$v6_vps" ]] && VPS_VPN_IPv6="$v6_vps" || true
-        read -rp "Home server WireGuard IPv6 address [fd00::2]: " v6_home
-        [[ -n "$v6_home" ]] && HOME_SERVER_IPv6="$v6_home" || true
+    # First run: wizard. Subsequent runs: load + confirm.
+    if load_script_config "$CONFIG_FILE"; then
+        if ! confirm_or_rewizard "Loaded config ($CONFIG_FILE)" \
+            VPS_PUBLIC_IP WG_PORT \
+            WG_VPN_IP_VPS WG_VPN_IP_HOME \
+            ENABLE_IPv6 VPS_VPN_IPv6 HOME_SERVER_IPv6; then
+            run_wizard
+        fi
+    else
+        echo "No config found — running first-time setup wizard."
+        run_wizard
     fi
 
+    backup_existing_wg_config
     install_wireguard
     wireguard_setup
     handle_ufw_for_wireguard
@@ -111,6 +146,9 @@ main() {
     echo
     echo "  Your home server public key (share with VPS):"
     sudo cat /etc/wireguard/publickey
+    echo
+    echo "  To change settings later, edit: $CONFIG_FILE"
+    echo "  Then re-run this script."
 
     auto_key_exchange \
         "<Public_Key_of_Home_Server>" \
