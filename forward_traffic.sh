@@ -351,7 +351,7 @@ Usage: $0 [options]
   --list          Show all currently active DNAT forwarding rules
   --dry-run       Show what would be applied without making changes
   --ipv6          Also apply ip6tables rules for IPv6 traffic
-  --reconfigure   Re-run the setup wizard even if a config exists
+  --edit-config   Open the config file in \$EDITOR (or re-run wizard if no editor)
   --audit [all]   Show audit log (last 50 entries, or all)
   --help          Show this help message
 
@@ -363,10 +363,37 @@ Audit log:    $AUDIT_LOG
 EOF
 }
 
+# ─── Config editor ───────────────────────────────────────────────────────────
+
+_edit_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No config file found at $CONFIG_FILE — running wizard first."
+        run_wizard
+        return
+    fi
+    local editor="${EDITOR:-}"
+    # Try common editors in order if $EDITOR is not set
+    if [[ -z "$editor" ]]; then
+        for e in nano vim vi; do
+            command -v "$e" &>/dev/null && editor="$e" && break
+        done
+    fi
+    if [[ -n "$editor" ]]; then
+        echo "Opening $CONFIG_FILE in $editor..."
+        sudo "$editor" "$CONFIG_FILE"
+        echo "Config updated. Reload will happen automatically on next run."
+        _load_config
+    else
+        echo "No editor found (set \$EDITOR or install nano/vim)."
+        echo "Edit $CONFIG_FILE manually and re-run."
+        exit 1
+    fi
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    local mode="add" reconfigure=false
+    local mode="add" edit_config=false
 
     for arg in "$@"; do
         case "$arg" in
@@ -374,7 +401,7 @@ main() {
             --list)         mode="list"       ;;
             --dry-run)      DRY_RUN=true      ;;
             --ipv6)         ENABLE_IPv6=true  ;;
-            --reconfigure)  reconfigure=true  ;;
+            --edit-config)  edit_config=true  ;;
             --audit)        ;;  # handled below
             --help)         usage; exit 0     ;;
             all)            ;;  # audit subarg
@@ -390,15 +417,13 @@ main() {
 
     [[ "$mode" == "list" ]] && { list_rules; exit 0; }
 
-    # Config: first run → wizard. Subsequent runs → load + confirm (or --reconfigure)
-    if $reconfigure || ! _load_config; then
-        [[ -f "$CONFIG_FILE" ]] && echo "Re-running setup wizard..." || echo "No config found — running first-time setup wizard."
+    # Config: first run → wizard; subsequent runs → silent load.
+    # To change settings: edit $CONFIG_FILE or pass --edit-config.
+    if $edit_config; then
+        _edit_config
+    elif ! _load_config; then
+        echo "No config found — running first-time setup wizard."
         run_wizard
-    else
-        if ! confirm_or_rewizard "Loaded config ($CONFIG_FILE)" \
-            PUBLIC_NETWORK_INTERFACE VPS_VPN_IP HOME_SERVER_IP ENABLE_IPv6; then
-            run_wizard
-        fi
     fi
 
     check_variables

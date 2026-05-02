@@ -124,6 +124,26 @@ AllowedIPs = ${peer_allowed}
 EOF
 }
 
+# ─── Config editor ───────────────────────────────────────────────────────────
+
+_edit_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No config file found at $CONFIG_FILE — running wizard first."
+        run_wizard; return
+    fi
+    local editor="${EDITOR:-}"
+    [[ -z "$editor" ]] && for e in nano vim vi; do
+        command -v "$e" &>/dev/null && editor="$e" && break
+    done
+    if [[ -n "$editor" ]]; then
+        echo "Opening $CONFIG_FILE in $editor..."
+        sudo "$editor" "$CONFIG_FILE"
+        load_script_config "$CONFIG_FILE"
+    else
+        echo "No editor found. Edit $CONFIG_FILE manually and re-run."; exit 1
+    fi
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -133,14 +153,19 @@ main() {
     echo
     echo "=== VPS Setup for WireGuard Port Forwarding ==="
 
-    # First run: wizard. Subsequent runs: load + confirm.
-    if load_script_config "$CONFIG_FILE"; then
-        if ! confirm_or_rewizard "Loaded config ($CONFIG_FILE)" \
+    # First run: wizard. Subsequent runs: silent load.
+    # To change settings: edit $CONFIG_FILE or pass --edit-config.
+    local edit_config=false
+    [[ "${1:-}" == "--edit-config" ]] && edit_config=true
+
+    if $edit_config; then
+        _edit_config
+    elif load_script_config "$CONFIG_FILE"; then
+        echo "Config loaded from $CONFIG_FILE"
+        show_config_summary "Current config" \
             PUBLIC_NETWORK_INTERFACE WG_PORT \
             WG_VPN_IP_VPS WG_VPN_IP_HOME \
-            ENABLE_IPv6 VPS_VPN_IPv6 HOME_SERVER_IPv6; then
-            run_wizard
-        fi
+            ENABLE_IPv6 VPS_VPN_IPv6 HOME_SERVER_IPv6
     else
         echo "No config found — running first-time setup wizard."
         run_wizard
@@ -169,8 +194,8 @@ main() {
     [[ -n "${VPS_PUBLIC_IP:-}" ]] && \
         echo "  Your VPS public IP (enter this in setup_home.sh): $VPS_PUBLIC_IP"
     echo
-    echo "  To change settings later, edit: $CONFIG_FILE"
-    echo "  Then re-run this script."
+    echo "  To change settings: edit $CONFIG_FILE directly,"
+    echo "  or re-run with: sudo $0 --edit-config"
 
     auto_key_exchange \
         "<Public_Key_of_VPS>" \
